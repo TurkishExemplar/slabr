@@ -3,7 +3,6 @@ const Anthropic = require('@anthropic-ai/sdk');
 const pool = require('../db');
 
 const router = express.Router();
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ── GET /api/scan/status — lightweight key-availability check ─────────────────
 router.get('/status', (req, res) => {
@@ -132,6 +131,9 @@ router.post('/', async (req, res) => {
   const base64 = image_base64.replace(/^data:[^;]+;base64,/, '');
 
   try {
+    // Lazy init — only constructed when a scan is actually requested,
+    // so a missing key never crashes the server on startup.
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     const message = await client.messages.create({
       model: 'claude-haiku-4-5',
       max_tokens: 1024,
