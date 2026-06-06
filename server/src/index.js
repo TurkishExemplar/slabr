@@ -32,12 +32,19 @@ const ALLOWED_ORIGINS = [
   'http://localhost:5173',
 ].filter(Boolean);
 
+// Matches any Vercel preview URL for this project, e.g.
+// https://slabr-73fp78rdv-slabr.vercel.app
+const VERCEL_PREVIEW_RE = /^https:\/\/slabr.*\.vercel\.app$/;
+
 // Log on startup so Railway logs confirm what origins are whitelisted.
-console.log('[cors] Allowed origins:', ALLOWED_ORIGINS);
+console.log('[cors] Allowed origins:', ALLOWED_ORIGINS, '+ /^https:\\/\\/slabr.*\\.vercel\\.app$/');
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin) || VERCEL_PREVIEW_RE.test(origin)) {
+      return callback(null, true);
+    }
     console.warn(`[cors] Blocked origin: ${origin}`);
     callback(new Error(`CORS: origin not allowed — ${origin}`));
   },
