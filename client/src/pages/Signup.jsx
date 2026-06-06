@@ -19,7 +19,9 @@ export default function Signup() {
     setError('');
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/auth/signup`, {
+      const url = `${API}/api/auth/signup`;
+      console.log('[slabr] Signup fetch →', url);
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form),
@@ -31,7 +33,8 @@ export default function Signup() {
       }
       login(data.token, data.user);
       navigate('/dashboard', { replace: true });
-    } catch {
+    } catch (err) {
+      console.error('[slabr] Signup fetch error:', err.name, err.message);
       setError('Network error — is the server running?');
     } finally {
       setLoading(false);

@@ -32,6 +32,9 @@ const ALLOWED_ORIGINS = [
   'http://localhost:5173',
 ].filter(Boolean);
 
+// Log on startup so Railway logs confirm what origins are whitelisted.
+console.log('[cors] Allowed origins:', ALLOWED_ORIGINS);
+
 app.use(cors({
   origin(origin, callback) {
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
