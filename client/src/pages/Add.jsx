@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../lib/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -60,7 +61,7 @@ export default function Add() {
   // Check scan availability once when the Scan tab becomes active
   useEffect(() => {
     if (activeTab !== 'scan' || scanState !== 'checking') return;
-    fetch('/api/scan/status', { headers: { Authorization: `Bearer ${token}` } })
+    fetch(`${API}/api/scan/status`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.json())
       .then(d => setScanState(d.available ? 'idle' : 'unavailable'))
       .catch(() => setScanState('unavailable'));
@@ -88,7 +89,7 @@ export default function Add() {
     const reader = new FileReader();
     reader.onload = async (evt) => {
       try {
-        const res = await fetch('/api/scan', {
+        const res = await fetch(`${API}/api/scan`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
@@ -160,7 +161,7 @@ export default function Add() {
         forecast_30d:     scanResult.forecast_30d,
       };
 
-      const res = await fetch('/api/portfolio', {
+      const res = await fetch(`${API}/api/portfolio`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
@@ -190,7 +191,7 @@ export default function Add() {
     setSearching(true);
     const t = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/catalog/search?q=${encodeURIComponent(q)}`);
+        const res = await fetch(`${API}/api/catalog/search?q=${encodeURIComponent(q)}`);
         setResults(await res.json());
       } catch {
         setResults([]);
@@ -243,7 +244,7 @@ export default function Add() {
         purchase_date:   form.purchase_date || null,
       };
 
-      const res = await fetch('/api/portfolio', {
+      const res = await fetch(`${API}/api/portfolio`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),

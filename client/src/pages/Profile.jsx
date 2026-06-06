@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../lib/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -113,7 +114,7 @@ export default function Profile() {
   useEffect(() => {
     setLoading(true);
     setFetchError(null);
-    fetch(`/api/users/${encodeURIComponent(username)}`)
+    fetch(`${API}/api/users/${encodeURIComponent(username)}`)
       .then(r => r.json())
       .then(data => {
         setProfile(data);

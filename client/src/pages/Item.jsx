@@ -4,6 +4,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../lib/api';
 
 function fmt$(n) {
   if (n == null || isNaN(n)) return '—';
@@ -63,7 +64,7 @@ export default function Item() {
 
   useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
-    fetch(`/api/portfolio/${id}`, { headers })
+    fetch(`${API}/api/portfolio/${id}`, { headers })
       .then(r => r.json())
       .then(data => {
         if (data.error) { setError(data.error); return; }
@@ -107,7 +108,7 @@ export default function Item() {
         purchase_price:  editForm.purchase_price !== '' ? parseFloat(editForm.purchase_price) : null,
         purchase_date:   editForm.purchase_date || null,
       };
-      const res  = await fetch(`/api/portfolio/${id}`, {
+      const res  = await fetch(`${API}/api/portfolio/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
@@ -128,7 +129,7 @@ export default function Item() {
     if (isNaN(val) || val <= 0) return;
     setSavingManualValue(true);
     try {
-      const res = await fetch(`/api/portfolio/${id}`, {
+      const res = await fetch(`${API}/api/portfolio/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ manual_value: val }),
@@ -152,7 +153,7 @@ export default function Item() {
 
   async function handleDelete() {
     try {
-      await fetch(`/api/portfolio/${id}`, {
+      await fetch(`${API}/api/portfolio/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       });

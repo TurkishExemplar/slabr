@@ -32,8 +32,20 @@ const { runEbayJob }  = require('./jobs/ebay');
 
 const app = express();
 
+// Build an allow-list: CLIENT_URL (set in Railway) + localhost variants for local dev.
+// Requests with no Origin header (curl, server-to-server) are always allowed.
+const ALLOWED_ORIGINS = [
+  process.env.CLIENT_URL,         // e.g. https://slabr.vercel.app
+  'http://localhost:3000',
+  'http://localhost:5173',
+].filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`[cors] Blocked origin: ${origin}`);
+    callback(new Error(`CORS: origin not allowed — ${origin}`));
+  },
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));

@@ -5,6 +5,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../lib/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -81,8 +82,8 @@ export default function Dashboard() {
   useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
     Promise.all([
-      fetch('/api/portfolio', { headers }).then(r => r.json()),
-      fetch('/api/portfolio/history', { headers }).then(r => r.json()),
+      fetch(`${API}/api/portfolio`, { headers }).then(r => r.json()),
+      fetch(`${API}/api/portfolio/history`, { headers }).then(r => r.json()),
     ])
       .then(([itemsData, historyData]) => {
         setItems(Array.isArray(itemsData) ? itemsData : []);

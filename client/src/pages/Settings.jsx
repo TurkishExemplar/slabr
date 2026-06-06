@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../lib/api';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,7 +70,7 @@ export default function Settings() {
     if (!token) return;
     const headers = { Authorization: `Bearer ${token}` };
 
-    fetch('/api/users/me/stats', { headers })
+    fetch(`${API}/api/users/me/stats`, { headers })
       .then(r => r.json())
       .then(data => {
         setUsername(data.username ?? '');
@@ -87,7 +88,7 @@ export default function Settings() {
     setProfileSaving(true);
     setProfileMsg(null);
     try {
-      const res = await fetch('/api/users/me', {
+      const res = await fetch(`${API}/api/users/me`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -117,7 +118,7 @@ export default function Settings() {
     setPwSaving(true);
     setPwMsg(null);
     try {
-      const res = await fetch('/api/users/me/password', {
+      const res = await fetch(`${API}/api/users/me/password`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
