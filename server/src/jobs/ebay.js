@@ -396,15 +396,31 @@ function inferItemType(item) {
   return 'sports_card';
 }
 
+// eBay category IDs that cover the entire collectibles card universe.
+// Passing these eliminates shoes, clothing, car parts, etc.
+//   212      — Sports Trading Cards
+//   183454   — CCG Individual Cards (Pokémon, MTG, Yu-Gi-Oh…)
+//   259104   — Comics
+//   183456   — Sealed Trading Card Packs & Sets
+const CARD_CATEGORY_IDS = '212,183454,259104,183456';
+
 async function ebaySearch(query, limit = 25) {
   const token  = await getToken();
   const env    = (process.env.EBAY_ENV ?? 'production').toLowerCase();
   const base   = API_BASE[env] ?? API_BASE.production;
+
+  // Single-word queries (e.g. "pokemon") are too generic and pull in
+  // unrelated merchandise even with category filters. Append "trading card"
+  // so eBay's relevance ranking focuses on card listings.
+  const words = query.trim().split(/\s+/);
+  const q     = words.length < 2 ? `${query.trim()} trading card` : query.trim();
+
   const params = new URLSearchParams({
-    q:      query,
-    limit:  String(Math.min(limit, 50)),
-    filter: 'buyingOptions:{FIXED_PRICE}',
-    sort:   'newlyListed',
+    q:           q,
+    limit:       String(Math.min(limit, 50)),
+    categoryIds: CARD_CATEGORY_IDS,
+    filter:      'buyingOptions:{FIXED_PRICE}',
+    sort:        'newlyListed',
   });
 
   const res = await fetch(`${base}/buy/browse/v1/item_summary/search?${params}`, {
