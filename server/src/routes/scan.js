@@ -19,40 +19,60 @@ function itemTypeFromHint(hint) {
   return 'sports_card';
 }
 
-// Find an existing master_catalog row or auto-insert one
-async function resolveCatalogId(fields) {
+// Find an existing master_catalog row or auto-insert one.
+// scanImageBase64: full data-URL from the scan photo — used as a temporary
+// image_url until priceSingleItem replaces it with a real eBay CDN image.
+// Only stored if the catalog entry has no image and the payload is ≤ 1 MB.
+async function resolveCatalogId(fields, scanImageBase64 = null) {
   const { item_type, name, set_name, card_number, year, sport_game, rarity } = fields;
   if (!name) return null;
+
+  let id = null;
 
   // 1. Exact name match
   let res = await pool.query(
     'SELECT id FROM master_catalog WHERE name ILIKE $1 LIMIT 1',
     [`%${name}%`]
   );
-  if (res.rows.length) return res.rows[0].id;
+  if (res.rows.length) id = res.rows[0].id;
 
   // 2. Name + set match
-  if (set_name) {
+  if (!id && set_name) {
     res = await pool.query(
       'SELECT id FROM master_catalog WHERE set_name ILIKE $1 AND card_number = $2 LIMIT 1',
       [`%${set_name}%`, card_number]
     );
-    if (res.rows.length) return res.rows[0].id;
+    if (res.rows.length) id = res.rows[0].id;
   }
 
   // 3. Auto-create catalog entry from scan data
-  res = await pool.query(
-    `INSERT INTO master_catalog
-       (item_type, name, year, set_name, card_number, sport_game, rarity)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
-     RETURNING id`,
-    [
-      item_type || 'sports_card',
-      name, year ?? null, set_name ?? null,
-      card_number ?? null, sport_game ?? null, rarity ?? null,
-    ]
-  );
-  return res.rows[0].id;
+  if (!id) {
+    res = await pool.query(
+      `INSERT INTO master_catalog
+         (item_type, name, year, set_name, card_number, sport_game, rarity)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id`,
+      [
+        item_type || 'sports_card',
+        name, year ?? null, set_name ?? null,
+        card_number ?? null, sport_game ?? null, rarity ?? null,
+      ]
+    );
+    id = res.rows[0].id;
+  }
+
+  // ── Temporary image from scan photo ──────────────────────────────────────
+  // Store the scan base64 as image_url so the card shows an image immediately.
+  // Skipped if the payload is > 1 MB (large raw camera photos) — eBay will
+  // provide a CDN-optimised image once priceSingleItem runs.
+  if (scanImageBase64 && id && scanImageBase64.length <= 1_000_000) {
+    await pool.query(
+      `UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL`,
+      [scanImageBase64, id]
+    );
+  }
+
+  return id;
 }
 
 const SCAN_PROMPT = `You are a collectibles identification expert specializing in graded trading card slabs.
@@ -188,7 +208,9 @@ router.post('/', scanLimiter, async (req, res) => {
       confidence:      parsed.confidence       ?? 0.5,
     };
 
-    const catalog_id = await resolveCatalogId({ ...identified, item_type: derivedType });
+    // Pass the scan photo so resolveCatalogId can save it as a temporary
+    // image_url (replaced by a real eBay CDN URL once priceSingleItem runs).
+    const catalog_id = await resolveCatalogId({ ...identified, item_type: derivedType }, image_base64);
 
     res.json({ match: true, catalog_id, ...identified });
 

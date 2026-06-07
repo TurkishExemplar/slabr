@@ -24,12 +24,14 @@ const SOURCE_STYLE = {
   ximilar: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
   manual:  'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:    'bg-zinc-500/10 text-zinc-500 border-zinc-700',
+  none:    'bg-zinc-500/10 text-zinc-600 border-zinc-800',
 };
 const SOURCE_LABEL = {
   ebay:    'Powered by eBay',
   ximilar: 'Powered by Ximilar',
   manual:  'Owner Estimated',
   mock:    'Mock Data',
+  none:    'Not yet priced',
 };
 
 const CERT_URL = {
@@ -187,7 +189,9 @@ export default function Item() {
   const totalCost  = cost != null ? cost * item.quantity : null;
   const gain       = totalValue != null && totalCost != null ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
-  const src        = isOneOfOne ? 'manual' : (item.price_source ?? 'mock');
+  // 'none' = no price history at all (new scan, not yet priced or no eBay results)
+  // 'mock' = has a seeded mock price_history row
+  const src        = isOneOfOne ? 'manual' : (item.price_source ?? 'none');
   const gradeLabel = item.condition === 'graded' && (item.grading_company || item.grade)
     ? [item.grading_company, item.grade].filter(Boolean).join(' ')
     : item.condition === 'raw' ? 'Raw' : null;
@@ -445,6 +449,29 @@ export default function Item() {
                   {item.active_low != null ? fmt$(item.active_low) : '—'}
                 </span>
               </div>
+
+              {/* No eBay data found — offer manual eBay search */}
+              {!isOneOfOne && item.ph_value == null && item.active_low == null && (
+                <div className="flex items-center justify-between gap-3 py-1">
+                  <p className="text-zinc-600 text-sm">No eBay listings found for this card</p>
+                  <a
+                    href={`https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(
+                      [
+                        item.name,
+                        item.year,
+                        item.grade
+                          ? `${item.grading_company ?? ''} ${item.grade}`.trim()
+                          : null,
+                      ].filter(Boolean).join(' ')
+                    )}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="shrink-0 text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-500/30 hover:border-indigo-500/50 px-3 py-1.5 rounded-lg transition whitespace-nowrap"
+                  >
+                    Search eBay ↗
+                  </a>
+                </div>
+              )}
 
               {/* 30-day Forecast — hidden for 1/1 */}
               {!isOneOfOne && item.forecast_30d != null && (

@@ -215,7 +215,9 @@ async function fetchMarketPrices(specificKeywords, looseKeywords) {
   }
 }
 
-// Active low (Fixed Price) via Browse API
+// Active low (Fixed Price) via Browse API.
+// Returns { activeLow, imageUrl } — imageUrl is the first listing's image so
+// priceSingleItem can replace a temporary scan photo with a real eBay CDN URL.
 async function fetchActiveLow(keywords) {
   const data = await ebayGet('/buy/browse/v1/item_summary/search', {
     q:      keywords,
@@ -224,11 +226,15 @@ async function fetchActiveLow(keywords) {
     filter: 'buyingOptions:{FIXED_PRICE}',
   });
 
-  const prices = (data.itemSummaries ?? [])
+  const items  = data.itemSummaries ?? [];
+  const prices = items
     .map(i => parseFloat(i.price?.value))
     .filter(v => !isNaN(v) && v > 0);
 
-  return prices.length ? Math.min(...prices) : null;
+  return {
+    activeLow: prices.length ? Math.min(...prices) : null,
+    imageUrl:  items[0]?.image?.imageUrl ?? null,
+  };
 }
 
 // Single most-recent sold comparable (for 1/1 parallel search)
@@ -307,8 +313,8 @@ async function runEbayJob() {
         skippedOneOfOne++;
       }
 
-      // Active low
-      activeLow = await fetchActiveLow(keywords);
+      // Active low (imageUrl unused in bulk job — priceSingleItem handles image updates)
+      ({ activeLow } = await fetchActiveLow(keywords));
       console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
       await sleep(400);
 
@@ -516,7 +522,22 @@ async function priceSingleItem(catalogId, condition, grade) {
     const prices = await fetchMarketPrices(keywords, soldKeywords);
     soldMedian   = computeMedian(prices);
   }
-  activeLow = await fetchActiveLow(keywords);
+
+  const activeResult = await fetchActiveLow(keywords);
+  activeLow = activeResult.activeLow;
+
+  // Replace a temporary scan-photo data URL with a real eBay CDN image.
+  // Only fires when eBay returned at least one listing with a real image URL.
+  if (activeResult.imageUrl) {
+    await pool.query(
+      `UPDATE master_catalog
+       SET image_url = $1
+       WHERE id = $2
+         AND (image_url IS NULL OR image_url LIKE 'data:%')`,
+      [activeResult.imageUrl, catalogId]
+    );
+    console.log(`[pricing] catalog image updated from eBay for catalog_id=${catalogId}`);
+  }
 
   if (soldMedian != null || activeLow != null) {
     await pool.query(`
