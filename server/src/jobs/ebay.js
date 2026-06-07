@@ -404,26 +404,41 @@ function inferItemType(item) {
 //   183456   — Sealed Trading Card Packs & Sets
 const CARD_CATEGORY_IDS = '212,183454,259104,183456';
 
+// Title patterns that definitively indicate non-card merchandise.
+// Applied as a client-side safety net after eBay's category filter.
+const REJECT_TITLE_RE =
+  /\b(t-shirt|hoodie|sweatshirt|sneaker|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat\b|cap\b|pants\b|jacket\b)\b/i;
+
 async function ebaySearch(query, limit = 25) {
-  const token  = await getToken();
-  const env    = (process.env.EBAY_ENV ?? 'production').toLowerCase();
-  const base   = API_BASE[env] ?? API_BASE.production;
+  const token = await getToken();
+  const env   = (process.env.EBAY_ENV ?? 'production').toLowerCase();
+  const base  = API_BASE[env] ?? API_BASE.production;
 
-  // Single-word queries (e.g. "pokemon") are too generic and pull in
-  // unrelated merchandise even with category filters. Append "trading card"
-  // so eBay's relevance ranking focuses on card listings.
+  // Single-word queries are too generic — append "trading card" so eBay's
+  // relevance ranking focuses on card listings even within the category filter.
   const words = query.trim().split(/\s+/);
-  const q     = words.length < 2 ? `${query.trim()} trading card` : query.trim();
+  const base_q = words.length < 2 ? `${query.trim()} trading card` : query.trim();
 
-  const params = new URLSearchParams({
-    q:           q,
-    limit:       String(Math.min(limit, 50)),
-    categoryIds: CARD_CATEGORY_IDS,
-    filter:      'buyingOptions:{FIXED_PRICE}',
-    sort:        'newlyListed',
-  });
+  // Negative keywords suppress common non-card merchandise.
+  // eBay Browse API has limited boolean support but this still helps ranking.
+  const q = `${base_q} -shirt -shoes -clothing -apparel -jersey`;
 
-  const res = await fetch(`${base}/buy/browse/v1/item_summary/search?${params}`, {
+  // ── Build URL manually ────────────────────────────────────────────────────
+  // URLSearchParams encodes commas as %2C.  eBay Browse API requires literal
+  // commas in categoryIds (e.g. "212,183454") — the encoded form is silently
+  // ignored, causing the category filter to have no effect.
+  const qs = [
+    `q=${encodeURIComponent(q)}`,
+    `limit=${Math.min(limit, 50)}`,
+    `categoryIds=${CARD_CATEGORY_IDS}`,                     // commas stay literal
+    `filter=${encodeURIComponent('buyingOptions:{FIXED_PRICE}')}`,
+    `sort=newlyListed`,
+  ].join('&');
+  const url = `${base}/buy/browse/v1/item_summary/search?${qs}`;
+
+  console.log(`[ebay] ebaySearch URL: ${url}`);
+
+  const res = await fetch(url, {
     headers: {
       Authorization:             `Bearer ${token}`,
       'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
@@ -437,8 +452,16 @@ async function ebaySearch(query, limit = 25) {
     throw new Error(`eBay search HTTP ${res.status}: ${text.slice(0, 160)}`);
   }
 
-  const data = await res.json();
-  return (data.itemSummaries ?? []).map(item => ({
+  const data  = await res.json();
+  const raw   = data.itemSummaries ?? [];
+
+  // ── Client-side safety filter ─────────────────────────────────────────────
+  // Removes any items that slipped through with obviously non-card titles.
+  const clean = raw.filter(item => !REJECT_TITLE_RE.test(item.title ?? ''));
+
+  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${clean.length} after title filter`);
+
+  return clean.map(item => ({
     source:        'ebay',
     ebay_item_id:  item.itemId,
     name:          item.title,
