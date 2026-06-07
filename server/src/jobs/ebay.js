@@ -371,4 +371,77 @@ async function ebaySearch(query, limit = 25) {
   }));
 }
 
-module.exports = { runEbayJob, ebaySearch };
+// ── Instant single-item pricer (called right after a portfolio add) ───────────
+//
+// Fetches eBay prices for one (catalogId, condition, grade) combo,
+// writes a price_history row, and updates portfolio_items. Non-blocking —
+// callers should fire this with setImmediate() so the HTTP response goes
+// out first.
+
+async function priceSingleItem(catalogId, condition, grade) {
+  const appId  = (process.env.EBAY_APP_ID  ?? '').trim();
+  const certId = (process.env.EBAY_CERT_ID ?? '').trim();
+  if (!appId || !certId) return null;
+
+  // Grab the catalog metadata + grading company from the matching portfolio row
+  const { rows } = await pool.query(`
+    SELECT
+      mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
+      mc.brand_publisher, mc.sport_game, mc.ebay_search_query,
+      pi.grading_company, pi.is_one_of_one
+    FROM master_catalog mc
+    JOIN portfolio_items pi ON pi.catalog_id = mc.id
+    WHERE mc.id = $1
+      AND (pi.condition IS NOT DISTINCT FROM $2)
+      AND (pi.grade     IS NOT DISTINCT FROM $3)
+    LIMIT 1
+  `, [catalogId, condition, grade]);
+
+  if (!rows.length) return null;
+
+  const catalogRow = { ...rows[0], condition, grade };
+  const keywords   = buildQuery(catalogRow);
+  const isOneOfOne = catalogRow.is_one_of_one === true;
+
+  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — query: "${keywords}"`);
+
+  let soldMedian = null;
+  let activeLow  = null;
+
+  if (!isOneOfOne) {
+    const prices = await fetchSoldPrices(keywords);
+    soldMedian   = computeMedian(prices);
+  }
+  activeLow = await fetchActiveLow(keywords);
+
+  if (soldMedian != null || activeLow != null) {
+    await pool.query(`
+      INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
+      VALUES ($1, $2, $3, $4, $5, 'ebay')
+    `, [catalogId, condition, grade, soldMedian, activeLow]);
+
+    if (!isOneOfOne) {
+      await pool.query(`
+        UPDATE portfolio_items
+        SET current_value = COALESCE($1, current_value),
+            active_low    = COALESCE($2, active_low)
+        WHERE catalog_id = $3
+          AND (condition IS NOT DISTINCT FROM $4)
+          AND (grade     IS NOT DISTINCT FROM $5)
+          AND (is_one_of_one IS NOT TRUE)
+      `, [soldMedian, activeLow, catalogId, condition, grade]);
+    } else {
+      await pool.query(
+        'UPDATE portfolio_items SET active_low = $1 WHERE catalog_id = $2 AND is_one_of_one = true',
+        [activeLow, catalogId]
+      );
+    }
+    console.log(`[pricing] Done — sold_median=${soldMedian != null ? '$'+soldMedian : '—'}, active_low=${activeLow != null ? '$'+activeLow : '—'}`);
+  } else {
+    console.log(`[pricing] No prices found for "${keywords}"`);
+  }
+
+  return { soldMedian, activeLow };
+}
+
+module.exports = { runEbayJob, ebaySearch, priceSingleItem };

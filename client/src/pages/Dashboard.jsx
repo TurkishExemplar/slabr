@@ -79,6 +79,9 @@ export default function Dashboard() {
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [conditionFilter, setConditionFilter] = useState('all');
 
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshMsg, setRefreshMsg] = useState(null); // { type: 'ok'|'warn'|'error', text }
+
   useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
     Promise.all([
@@ -92,6 +95,58 @@ export default function Dashboard() {
       .catch(err => setError(err.message))
       .finally(() => setLoading(false));
   }, [token]);
+
+  async function loadPortfolio() {
+    const headers = { Authorization: `Bearer ${token}` };
+    const [itemsData, historyData] = await Promise.all([
+      fetch(`${API}/api/portfolio`, { headers }).then(r => r.json()),
+      fetch(`${API}/api/portfolio/history`, { headers }).then(r => r.json()),
+    ]);
+    setItems(Array.isArray(itemsData) ? itemsData : []);
+    setHistory(Array.isArray(historyData) ? historyData : []);
+  }
+
+  async function handleRefreshPrices() {
+    setRefreshing(true);
+    setRefreshMsg(null);
+
+    // 45s abort — eBay job can be slow for large collections
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
+
+    try {
+      const res = await fetch(`${API}/api/admin/ebay-job`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const data = await res.json();
+
+      if (data.skipped) {
+        setRefreshMsg({ type: 'warn', text: 'eBay credentials not configured on Railway' });
+        return;
+      }
+
+      await loadPortfolio();
+      const n = data.updated ?? 0;
+      setRefreshMsg({ type: 'ok', text: `Updated ${n} item${n !== 1 ? 's' : ''}` });
+      setTimeout(() => setRefreshMsg(null), 4000);
+    } catch (err) {
+      clearTimeout(timeout);
+      if (err.name === 'AbortError') {
+        // Job is still running server-side — reload data anyway
+        try { await loadPortfolio(); } catch {}
+        setRefreshMsg({ type: 'ok', text: 'Prices updating in the background…' });
+        setTimeout(() => setRefreshMsg(null), 5000);
+      } else {
+        setRefreshMsg({ type: 'error', text: 'Refresh failed — check Railway logs' });
+        setTimeout(() => setRefreshMsg(null), 5000);
+      }
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   const stats = useMemo(() => {
     const totalValue = items.reduce((s, i) => s + effectiveValue(i) * i.quantity, 0);
@@ -153,7 +208,7 @@ export default function Dashboard() {
             </div>
             <span className="text-white font-semibold tracking-tight">Slabr</span>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             <Link
               to={`/profile/${user?.username}`}
               className="text-zinc-500 hover:text-white text-sm transition hidden sm:block"
@@ -170,6 +225,28 @@ export default function Dashboard() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
             </Link>
+
+            {/* Refresh Prices */}
+            <button
+              onClick={handleRefreshPrices}
+              disabled={refreshing}
+              title="Refresh prices from eBay"
+              className="flex items-center gap-1.5 text-zinc-500 hover:text-white disabled:opacity-40 transition"
+            >
+              {refreshing
+                ? <div className="w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin" />
+                : (
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                )
+              }
+              <span className="hidden sm:inline text-sm">
+                {refreshing ? 'Refreshing…' : 'Refresh Prices'}
+              </span>
+            </button>
+
             <Link
               to="/add"
               className="bg-indigo-500 hover:bg-indigo-600 text-white text-sm font-medium px-3 py-1.5 rounded-lg transition"
@@ -249,8 +326,9 @@ export default function Dashboard() {
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
-                <div className="h-[180px] flex items-center justify-center text-zinc-600 text-sm">
-                  Not enough history to chart yet
+                <div className="h-[180px] flex flex-col items-center justify-center gap-1.5">
+                  <p className="text-zinc-600 text-sm">No price history yet</p>
+                  <p className="text-zinc-700 text-xs">Prices update daily · use Refresh Prices to fetch now</p>
                 </div>
               )}
             </div>
@@ -360,6 +438,17 @@ export default function Dashboard() {
         )}
 
       </main>
+
+      {/* Refresh-prices toast */}
+      {refreshMsg && (
+        <div className={`fixed bottom-5 right-5 z-50 flex items-center gap-2 px-4 py-3 rounded-xl border text-sm shadow-2xl transition-all ${
+          refreshMsg.type === 'ok'    ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' :
+          refreshMsg.type === 'warn'  ? 'bg-amber-500/20  border-amber-500/30  text-amber-300'    :
+                                        'bg-red-500/20     border-red-500/30     text-red-300'
+        }`}>
+          {refreshMsg.text}
+        </div>
+      )}
     </div>
   );
 }

@@ -119,6 +119,20 @@ router.post('/', async (req, res) => {
     ]);
 
     res.status(201).json(rows[0]);
+
+    // ── Background instant pricing ────────────────────────────────────────
+    // Run after the response is sent so the user isn't blocked.
+    // Only fires when eBay credentials are configured.
+    if ((process.env.EBAY_APP_ID ?? '').trim() && (process.env.EBAY_CERT_ID ?? '').trim()) {
+      setImmediate(async () => {
+        try {
+          const { priceSingleItem } = require('../jobs/ebay');
+          await priceSingleItem(catalog_id, condition ?? null, grade ?? null);
+        } catch (err) {
+          console.error(`[pricing] Auto-price failed for catalog ${catalog_id}:`, err.message);
+        }
+      });
+    }
   } catch (err) {
     console.error('[portfolio POST]', err.message);
     res.status(500).json({ error: 'Server error' });
