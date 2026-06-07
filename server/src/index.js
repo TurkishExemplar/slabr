@@ -12,16 +12,26 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
-const express = require('express');
-const cors    = require('cors');
-const cron    = require('node-cron');
-const pool    = require('./db');
-const migrate = require('./migrate');
-const seed    = require('./seed');
-const authMiddleware = require('./middleware/auth');
-const { runEbayJob } = require('./jobs/ebay');
+const express  = require('express');
+const cors     = require('cors');
+const helmet   = require('helmet');
+const cron     = require('node-cron');
+const pool     = require('./db');
+const migrate  = require('./migrate');
+const seed     = require('./seed');
+const authMiddleware  = require('./middleware/auth');
+const adminMiddleware = require('./middleware/admin');
+const sanitize        = require('./middleware/sanitize');
+const { apiLimiter, adminLimiter } = require('./middleware/rateLimiter');
+const { runEbayJob }  = require('./jobs/ebay');
 
 const app = express();
+
+// ── Security headers (Helmet) ─────────────────────────────────────────────
+// This is a JSON-only API so Content-Security-Policy is irrelevant and
+// disabled.  Everything else (X-Frame-Options, X-DNS-Prefetch-Control, HSTS,
+// X-Content-Type-Options, etc.) is enabled at the defaults.
+app.use(helmet({ contentSecurityPolicy: false }));
 
 // ── CORS ──────────────────────────────────────────────────────────────────
 // CLIENT_URL is set in Railway env (e.g. https://slabr.vercel.app).
@@ -52,6 +62,10 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
+// ── Global middleware ─────────────────────────────────────────────────────
+app.use(sanitize);         // trim + null-byte strip on every req.body
+app.use('/api', apiLimiter); // 300 req / 15 min per IP safety net
+
 // ── Root health probe ─────────────────────────────────────────────────────
 // Railway (and other platforms) probe GET / to decide whether the instance
 // is alive. This route must respond 200 immediately — no DB query —
@@ -68,7 +82,7 @@ try {
   app.use('/api/catalog',   require('./routes/catalog'));
   app.use('/api/scan',      authMiddleware, require('./routes/scan'));
   app.use('/api/users',     require('./routes/users'));
-  app.use('/api/admin',     authMiddleware, require('./routes/admin'));
+  app.use('/api/admin',     adminLimiter, authMiddleware, adminMiddleware, require('./routes/admin'));
   console.log('[startup] All routes registered.');
 } catch (err) {
   console.error('[startup] FATAL — failed to load a route file:\n', err.stack ?? String(err));

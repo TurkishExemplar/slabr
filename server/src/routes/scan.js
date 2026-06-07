@@ -1,6 +1,7 @@
-const express = require('express');
-const Anthropic = require('@anthropic-ai/sdk');
-const pool = require('../db');
+const express   = require('express');
+const Anthropic  = require('@anthropic-ai/sdk');
+const pool       = require('../db');
+const { scanLimiter } = require('../middleware/rateLimiter');
 
 const router = express.Router();
 
@@ -86,7 +87,7 @@ Rules:
 - If this is not a recognizable collectible, return { "is_collectible": false }`;
 
 // ── POST /api/scan ────────────────────────────────────────────────────────────
-router.post('/', async (req, res) => {
+router.post('/', scanLimiter, async (req, res) => {
   if (!(process.env.ANTHROPIC_API_KEY ?? '').trim()) {
     return res.json({ error: 'Scan unavailable', fallback: 'search' });
   }

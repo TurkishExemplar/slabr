@@ -1,9 +1,10 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const pool = require('../db');
-const authMiddleware = require('../middleware/auth');
+const bcrypt  = require('bcryptjs');
+const crypto  = require('crypto');
+const jwt     = require('jsonwebtoken');
+const pool    = require('../db');
+const authMiddleware        = require('../middleware/auth');
+const { authLimiter }       = require('../middleware/rateLimiter');
 
 const router = express.Router();
 
@@ -19,7 +20,7 @@ function signToken(user) {
 }
 
 // POST /api/auth/signup
-router.post('/signup', async (req, res) => {
+router.post('/signup', authLimiter, async (req, res) => {
   const { email, password, username } = req.body ?? {};
 
   if (!email || !password || !username) {
@@ -56,7 +57,7 @@ router.post('/signup', async (req, res) => {
 });
 
 // POST /api/auth/login
-router.post('/login', async (req, res) => {
+router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body ?? {};
 
   if (!email || !password) {
@@ -138,7 +139,7 @@ async function sendResetEmail(to, resetUrl) {
 }
 
 // POST /api/auth/forgot-password
-router.post('/forgot-password', async (req, res) => {
+router.post('/forgot-password', authLimiter, async (req, res) => {
   const { email } = req.body ?? {};
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
@@ -176,7 +177,7 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 // POST /api/auth/reset-password
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body ?? {};
 
   if (!token || !password) {
