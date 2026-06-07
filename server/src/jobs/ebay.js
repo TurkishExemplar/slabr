@@ -101,14 +101,17 @@ async function ebayGet(path, params = {}) {
 function buildQuery(item) {
   if (item.ebay_search_query) return item.ebay_search_query;
 
-  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade } = item;
-  const gradeStr = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
+  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade, rarity } = item;
+  const gradeStr   = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
+  // Append "Rookie" when the card is explicitly tagged as a rookie — helps
+  // eBay ranking favour the RC version over cheaper parallels or reprint sets.
+  const rookieTag  = rarity && /\brookie\b/i.test(rarity) ? 'Rookie' : '';
 
   switch (item_type) {
     case 'sports_card':
-      // card_number added so "Stephen Curry 2009 Topps 321 PSA 9" is
-      // specific enough to match the slab, not the raw base set card.
-      return [name, year, set_name, card_number, gradeStr].filter(Boolean).join(' ');
+      // card_number + rookieTag so "Stephen Curry 2009 Topps 321 Rookie PSA 9"
+      // is specific enough to match the slab, not any other Curry card.
+      return [name, year, set_name, card_number, rookieTag, gradeStr].filter(Boolean).join(' ');
     case 'tcg':
       return [name, set_name, card_number, gradeStr].filter(Boolean).join(' ');
     case 'comic':
@@ -120,16 +123,19 @@ function buildQuery(item) {
   }
 }
 
-// Loose query for the sold-price fallback search.
-// For GRADED items we keep the grading company + grade even in the loose query —
-// dropping them would match raw ($10) copies instead of slabs ($4,000).
-// We only relax by dropping set_name and card_number.
+// Sold-price fallback query.
+// For GRADED items we keep card_number + grade/company even in the loose query so
+// we never fall back to a different card's price. "Loose" here only means we drop
+// set_name (which eBay sellers sometimes omit) but keep the distinguishing fields.
 function buildSoldQuery(item) {
-  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade } = item;
-  const gradeStr = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
+  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade, rarity } = item;
+  const gradeStr  = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
+  const rookieTag = rarity && /\brookie\b/i.test(rarity) ? 'Rookie' : '';
 
   switch (item_type) {
-    case 'sports_card': return [name, year, gradeStr].filter(Boolean).join(' ');
+    // card_number kept here (dropped set_name) so "Stephen Curry 2009 321 PSA 9"
+    // can't match cheaper Curry PSA 9 cards from Topps Chrome / Finest / etc.
+    case 'sports_card': return [name, year, card_number, rookieTag, gradeStr].filter(Boolean).join(' ');
     case 'tcg':         return [name, gradeStr].filter(Boolean).join(' ');
     case 'comic':       return [name, brand_publisher, gradeStr].filter(Boolean).join(' ');
     case 'sealed':      return [name, year, sport_game, 'sealed'].filter(Boolean).join(' ');
@@ -140,12 +146,20 @@ function buildSoldQuery(item) {
 // ── Grade-aware result filters ────────────────────────────────────────────────
 
 // Keep only items whose title includes "<COMPANY> <GRADE>" (e.g. "PSA 9").
-// Prevents raw copies from contaminating the price sample for graded cards.
-// gradeFilter: { company: 'PSA', grade: '9' }  — pass null for raw items.
+// When gradeFilter.cardNumber is set, also requires the card number in the title
+// so a cheaper Stephen Curry PSA 9 from a different set can't dilute the price.
+// gradeFilter: { company: 'PSA', grade: '9', cardNumber: '321' }  — null for raw items.
 function filterByGradeTag(items, gradeFilter, titleField = 'title') {
   if (!gradeFilter?.company) return items;
   const tag = `${gradeFilter.company} ${gradeFilter.grade ?? ''}`.trim().toUpperCase();
-  return items.filter(i => (i[titleField] ?? '').toUpperCase().includes(tag));
+  const cn  = gradeFilter.cardNumber ? String(gradeFilter.cardNumber).toUpperCase() : null;
+  return items.filter(i => {
+    const title = (i[titleField] ?? '').toUpperCase();
+    if (!title.includes(tag)) return false;
+    // Card-number check: avoid matching other sets (e.g. Topps Chrome #321 vs base #321)
+    if (cn && !title.includes(cn)) return false;
+    return true;
+  });
 }
 
 // Pick the best image from a list of eBay listing summaries.
@@ -161,6 +175,33 @@ function pickBestImage(items, name) {
     parts.every(p => (i.title ?? '').toLowerCase().includes(p))
   );
   return (best ?? items[0])?.image?.imageUrl ?? null;
+}
+
+// Sealed-product titles that must never be used as a card image.
+// "set" is intentionally excluded — too common in card titles ("base set", etc.)
+const JUNK_IMAGE_RE = /\b(pack|box|lot|case|bundle|wrapper|wax|blaster|hobby)\b/i;
+
+// Dedicated image search — uses a clean (grade-free) query so we pick up
+// both raw card and graded-slab photos, then aggressively filters out
+// packs, boxes, and other sealed merchandise before selecting the best image.
+// Returns null on error so callers can skip the image update gracefully.
+async function fetchCardImage(item) {
+  const { name, year, set_name, card_number } = item;
+  const q = [name, year, set_name, card_number].filter(Boolean).join(' ');
+  try {
+    const data = await ebayGet('/buy/browse/v1/item_summary/search', {
+      q,
+      limit:  10,
+      sort:   'newlyListed',
+      filter: 'buyingOptions:{FIXED_PRICE}',
+    });
+    const valid = (data.itemSummaries ?? []).filter(i => !JUNK_IMAGE_RE.test(i.title ?? ''));
+    console.log(`[ebay] fetchCardImage "${q}": ${data.itemSummaries?.length ?? 0} raw → ${valid.length} after junk filter`);
+    return pickBestImage(valid, name);
+  } catch (err) {
+    console.error(`[ebay] fetchCardImage failed: ${err.message}`);
+    return null;
+  }
 }
 
 // Trim 10 % from each end, return median
@@ -327,7 +368,7 @@ async function runEbayJob() {
       pi.catalog_id, pi.condition, pi.grade, pi.grading_company,
       pi.is_one_of_one,
       mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
-      mc.brand_publisher, mc.sport_game, mc.ebay_search_query
+      mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity
     FROM portfolio_items pi
     JOIN master_catalog mc ON pi.catalog_id = mc.id
     ORDER BY pi.catalog_id, pi.condition, pi.grade
@@ -344,9 +385,10 @@ async function runEbayJob() {
       const keywords      = buildQuery(combo);
       const soldKeywords  = buildSoldQuery(combo);
       const isOneOfOne    = combo.is_one_of_one === true;
-      // Grade filter ensures results are slabs, not raw copies, for graded items.
+      // Grade filter: graded results must have company+grade+card_number in the title
+      // so cheaper same-player cards from other sets can't dilute the price sample.
       const gradeFilter   = combo.condition === 'graded' && combo.grading_company
-        ? { company: combo.grading_company, grade: combo.grade }
+        ? { company: combo.grading_company, grade: combo.grade, cardNumber: combo.card_number }
         : null;
 
       let soldMedian = null;
@@ -545,7 +587,7 @@ async function priceSingleItem(catalogId, condition, grade) {
   const { rows } = await pool.query(`
     SELECT
       mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
-      mc.brand_publisher, mc.sport_game, mc.ebay_search_query,
+      mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity,
       pi.grading_company, pi.is_one_of_one
     FROM master_catalog mc
     JOIN portfolio_items pi ON pi.catalog_id = mc.id
@@ -561,9 +603,11 @@ async function priceSingleItem(catalogId, condition, grade) {
   const keywords     = buildQuery(catalogRow);
   const soldKeywords = buildSoldQuery(catalogRow);
   const isOneOfOne   = catalogRow.is_one_of_one === true;
-  // Grade filter: ensures sold and active searches match graded slabs, not raw copies.
+  // Grade filter: ensures sold and active searches match graded slabs with the
+  // correct card number — prevents cheaper same-player same-grade cards from
+  // other sets diluting the price (e.g. Topps Chrome #321 vs base Topps #321).
   const gradeFilter  = condition === 'graded' && catalogRow.grading_company
-    ? { company: catalogRow.grading_company, grade }
+    ? { company: catalogRow.grading_company, grade, cardNumber: catalogRow.card_number }
     : null;
 
   console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active: "${keywords}" | sold: "${soldKeywords}"${gradeFilter ? ` | grade filter: ${gradeFilter.company} ${gradeFilter.grade}` : ''}`);
@@ -579,15 +623,18 @@ async function priceSingleItem(catalogId, condition, grade) {
   const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
   activeLow = activeResult.activeLow;
 
-  // Replace a temporary scan-photo data URL with a real eBay CDN image.
-  // Only fires when eBay returned at least one listing with a real image URL.
-  if (activeResult.imageUrl) {
+  // Fetch the card image via a dedicated search that filters out packs, boxes,
+  // and other sealed merchandise. This is separate from the price search so:
+  //   • we use a non-graded query (broader pool of card images)
+  //   • JUNK_IMAGE_RE eliminates titles like "2009 Topps Basketball Plastic Pack"
+  const imageUrl = await fetchCardImage(catalogRow);
+  if (imageUrl) {
     await pool.query(
       `UPDATE master_catalog
        SET image_url = $1
        WHERE id = $2
          AND (image_url IS NULL OR image_url LIKE 'data:%')`,
-      [activeResult.imageUrl, catalogId]
+      [imageUrl, catalogId]
     );
     console.log(`[pricing] catalog image updated from eBay for catalog_id=${catalogId}`);
   }
