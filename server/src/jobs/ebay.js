@@ -650,16 +650,15 @@ async function priceSingleItem(catalogId, condition, grade) {
   activeLow = activeResult.activeLow;
 
   // Fetch the card image via a dedicated search that filters out packs, boxes,
-  // and other sealed merchandise. This is separate from the price search so:
-  //   • we use a non-graded query (broader pool of card images)
-  //   • JUNK_IMAGE_RE eliminates titles like "2009 Topps Basketball Plastic Pack"
+  // and other sealed merchandise.  fetchCardImage's three-rule filter guarantees
+  // any returned URL is a real card photo, so we always overwrite the existing
+  // image_url — this fixes the case where a wrong image was saved before the
+  // junk filter existed and the old WHERE (IS NULL OR LIKE 'data:%') would
+  // silently skip re-fetching it.
   const imageUrl = await fetchCardImage(catalogRow);
   if (imageUrl) {
     await pool.query(
-      `UPDATE master_catalog
-       SET image_url = $1
-       WHERE id = $2
-         AND (image_url IS NULL OR image_url LIKE 'data:%')`,
+      'UPDATE master_catalog SET image_url = $1 WHERE id = $2',
       [imageUrl, catalogId]
     );
     console.log(`[pricing] catalog image updated from eBay for catalog_id=${catalogId}`);
@@ -696,4 +695,4 @@ async function priceSingleItem(catalogId, condition, grade) {
   return { soldMedian, activeLow };
 }
 
-module.exports = { runEbayJob, ebaySearch, priceSingleItem };
+module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage };

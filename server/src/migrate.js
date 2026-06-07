@@ -112,6 +112,22 @@ END $$;
 -- Phase 12: password reset
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;
+
+-- Clear bad image_url values so priceSingleItem / refresh-image can re-fetch.
+-- Targets data: URIs (saved scan photos that were never replaced) and any CDN
+-- URL that somehow contains junk keywords (pack, box, lot, etc.).
+-- Safe to run repeatedly — only NULLs rows that still have bad values.
+UPDATE master_catalog
+SET image_url = NULL
+WHERE image_url IS NOT NULL
+  AND (
+    image_url LIKE 'data:%'
+    OR LOWER(image_url) LIKE '%pack%'
+    OR LOWER(image_url) LIKE '%/lot/%'
+    OR LOWER(image_url) LIKE '%sealed%'
+    OR LOWER(image_url) LIKE '%wrapper%'
+    OR LOWER(image_url) LIKE '%wax%'
+  );
 `;
 
 async function migrate() {

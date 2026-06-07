@@ -59,6 +59,10 @@ export default function Item() {
   const [saving, setSaving]                 = useState(false);
   const [deleteConfirm, setDeleteConfirm]   = useState(false);
 
+  // Refresh Image
+  const [refreshingImg, setRefreshingImg]   = useState(false);
+  const [imgRefreshMsg, setImgRefreshMsg]   = useState(null);
+
   // 1/1 manual value editing
   const [editingManualValue, setEditingManualValue] = useState(false);
   const [manualValueInput, setManualValueInput]     = useState('');
@@ -97,6 +101,32 @@ export default function Item() {
       ? priceHistory.filter(r => new Date(r.date).getTime() >= cutoff)
       : priceHistory;
   }, [priceHistory, range]);
+
+  async function handleRefreshImage() {
+    setRefreshingImg(true);
+    setImgRefreshMsg(null);
+    try {
+      const res  = await fetch(`${API}/api/admin/refresh-image/${item.catalog_id}`, {
+        method:  'POST',
+        headers: {
+          Authorization:     `Bearer ${token}`,
+          'X-Admin-Secret':  import.meta.env.VITE_ADMIN_SECRET ?? '',
+        },
+      });
+      const data = await res.json();
+      if (data.ok && data.image_url) {
+        setItem(prev => ({ ...prev, image_url: data.image_url }));
+        setImgRefreshMsg('Image updated ✓');
+      } else {
+        setImgRefreshMsg(data.message ?? data.error ?? 'No clean image found');
+      }
+    } catch (e) {
+      setImgRefreshMsg('Request failed');
+    } finally {
+      setRefreshingImg(false);
+      setTimeout(() => setImgRefreshMsg(null), 4000);
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -264,6 +294,20 @@ export default function Item() {
                 ? <img src={item.image_url} alt={item.name} className="w-full h-full object-contain p-6" />
                 : <ItemIcon type={item.item_type} />
               }
+            </div>
+
+            {/* Refresh Image */}
+            <div className="flex flex-col items-center gap-1">
+              <button
+                onClick={handleRefreshImage}
+                disabled={refreshingImg}
+                className="w-full py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {refreshingImg ? 'Refreshing…' : '↻ Refresh Image'}
+              </button>
+              {imgRefreshMsg && (
+                <p className="text-xs text-zinc-500">{imgRefreshMsg}</p>
+              )}
             </div>
 
             {/* Identity */}
