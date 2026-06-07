@@ -41,10 +41,11 @@ const TYPE_BADGE = {
 const PRICE_SOURCE_STYLE = {
   ebay:    'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
   ximilar: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+  manual:  'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:    'bg-zinc-500/10 text-zinc-500 border-zinc-700',
 };
 
-const PRICE_SOURCE_LABEL = { ebay: 'eBay', ximilar: 'Ximilar', mock: 'Mock Data' };
+const PRICE_SOURCE_LABEL = { ebay: 'eBay', ximilar: 'Ximilar', manual: 'Owner Est.', mock: 'Mock Data' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -62,6 +63,9 @@ function fmtDate(str) {
 }
 
 function effectiveValue(item) {
+  if (item.is_one_of_one && item.manual_value != null) {
+    return parseFloat(item.manual_value);
+  }
   return parseFloat(item.current_value ?? item.ph_value ?? 0);
 }
 
@@ -477,7 +481,7 @@ function ItemCard({ item }) {
   const totalCost  = cost != null ? cost * item.quantity : null;
   const gain       = totalCost != null ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
-  const src        = item.price_source ?? 'mock';
+  const src        = item.is_one_of_one ? 'manual' : (item.price_source ?? 'mock');
 
   return (
     <Link to={`/item/${item.id}`} className="block bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden hover:border-zinc-700 transition">
@@ -491,12 +495,17 @@ function ItemCard({ item }) {
 
       {/* Body */}
       <div className="p-4 space-y-3">
-        {/* Type badge + year */}
-        <div className="flex items-center gap-2">
+        {/* Type badge + year + 1/1 badge */}
+        <div className="flex items-center gap-2 flex-wrap">
           <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider ${TYPE_BADGE[item.item_type] ?? 'bg-zinc-700 text-zinc-400'}`}>
             {CATEGORY_LABELS[item.item_type] ?? item.item_type}
           </span>
           {item.year && <span className="text-zinc-600 text-xs">{item.year}</span>}
+          {item.is_one_of_one && (
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30">
+              1 of 1
+            </span>
+          )}
         </div>
 
         {/* Name + set */}

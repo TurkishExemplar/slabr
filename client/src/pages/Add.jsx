@@ -30,6 +30,8 @@ const DEFAULT_FORM = {
   quantity: 1,
   purchase_price: '',
   purchase_date: '',
+  is_one_of_one: false,
+  manual_value: '',
 };
 
 const MANUAL_DEFAULT = {
@@ -39,6 +41,12 @@ const MANUAL_DEFAULT = {
   set_name: '',
   card_number: '',
 };
+
+// Detect 1/1 keywords in name, card number, or set name
+function detectOneOfOne(name = '', cardNumber = '', setName = '') {
+  const text = [name, cardNumber, setName].join(' ').toLowerCase();
+  return /\b1\/1\b|1 of 1|one of one|superfractor|printing plate|logoman/.test(text);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -123,6 +131,8 @@ export default function Add() {
           grade:           data.grade            ?? '',
           cert_number:     data.cert_number      ?? '',
           quantity: 1, purchase_price: '', purchase_date: '',
+          is_one_of_one: detectOneOfOne(data.name, data.card_number, data.set_name),
+          manual_value: '',
         });
         setScanState('result');
       } catch {
@@ -160,6 +170,9 @@ export default function Add() {
         scan_identified: true, scan_source: 'claude',
         scan_value:      scanResult.current_value,
         forecast_30d:    scanResult.forecast_30d,
+        is_one_of_one:   scanForm.is_one_of_one === true,
+        manual_value:    scanForm.is_one_of_one && scanForm.manual_value !== ''
+                           ? parseFloat(scanForm.manual_value) : null,
       };
       const res = await fetch(`${API}/api/portfolio`, {
         method: 'POST',
@@ -228,7 +241,8 @@ export default function Add() {
     }
 
     setSelectedItem(catalogItem);
-    setForm(DEFAULT_FORM);
+    const is1of1 = detectOneOfOne(catalogItem.name, catalogItem.card_number, catalogItem.set_name);
+    setForm({ ...DEFAULT_FORM, is_one_of_one: is1of1 });
     setFormError('');
     requestAnimationFrame(() => requestAnimationFrame(() => setPanelOpen(true)));
   }
@@ -288,6 +302,9 @@ export default function Add() {
         quantity:        parseInt(form.quantity) || 1,
         purchase_price:  form.purchase_price !== '' ? parseFloat(form.purchase_price) : null,
         purchase_date:   form.purchase_date  || null,
+        is_one_of_one:   form.is_one_of_one === true,
+        manual_value:    form.is_one_of_one && form.manual_value !== ''
+                           ? parseFloat(form.manual_value) : null,
       };
       const res = await fetch(`${API}/api/portfolio`, {
         method: 'POST',
@@ -763,6 +780,37 @@ export default function Add() {
                     </div>
                   </div>
 
+                  {/* 1/1 toggle */}
+                  <div className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg border border-zinc-700/50">
+                    <div>
+                      <p className="text-zinc-300 text-sm font-medium">This is a 1 of 1</p>
+                      <p className="text-zinc-600 text-xs">Superfractor, Printing Plate, Logoman, etc.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setScanForm(f => ({ ...f, is_one_of_one: !f.is_one_of_one }))}
+                      className={`w-11 h-6 rounded-full transition-colors duration-200 flex items-center px-0.5 shrink-0 ${scanForm.is_one_of_one ? 'bg-amber-500' : 'bg-zinc-700'}`}
+                    >
+                      <span className={`w-5 h-5 rounded-full bg-white shadow transform transition-transform duration-200 ${scanForm.is_one_of_one ? 'translate-x-5' : 'translate-x-0'}`} />
+                    </button>
+                  </div>
+
+                  {scanForm.is_one_of_one && (
+                    <div>
+                      <label className="block text-amber-400/80 text-xs font-medium mb-1.5 uppercase tracking-wider">
+                        Owner Estimated Value ($)
+                      </label>
+                      <input
+                        type="number" step="0.01" min="0"
+                        value={scanForm.manual_value ?? ''}
+                        onChange={e => setScanForm(f => ({ ...f, manual_value: e.target.value }))}
+                        placeholder="Your estimated value"
+                        className="w-full bg-zinc-800 border border-amber-500/30 rounded-lg px-3.5 py-2.5 text-white text-sm
+                                   placeholder-zinc-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 transition"
+                      />
+                    </div>
+                  )}
+
                   {scanSubmitError && (
                     <div className="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
                       {scanSubmitError}
@@ -895,6 +943,37 @@ export default function Add() {
                 <input type="date" value={form.purchase_date} onChange={setField('purchase_date')}
                   className={INPUT + ' [color-scheme:dark]'} />
               </div>
+
+              {/* 1/1 toggle */}
+              <div className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg border border-zinc-700/50">
+                <div>
+                  <p className="text-zinc-300 text-sm font-medium">This is a 1 of 1</p>
+                  <p className="text-zinc-600 text-xs">Superfractor, Printing Plate, Logoman, etc.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setForm(f => ({ ...f, is_one_of_one: !f.is_one_of_one }))}
+                  className={`w-11 h-6 rounded-full transition-colors duration-200 flex items-center px-0.5 shrink-0 ${form.is_one_of_one ? 'bg-amber-500' : 'bg-zinc-700'}`}
+                >
+                  <span className={`w-5 h-5 rounded-full bg-white shadow transform transition-transform duration-200 ${form.is_one_of_one ? 'translate-x-5' : 'translate-x-0'}`} />
+                </button>
+              </div>
+
+              {form.is_one_of_one && (
+                <div>
+                  <label className="block text-amber-400/80 text-xs font-medium mb-1.5 uppercase tracking-wider">
+                    Owner Estimated Value ($)
+                  </label>
+                  <input
+                    type="number" step="0.01" min="0"
+                    value={form.manual_value}
+                    onChange={setField('manual_value')}
+                    placeholder="Your estimated value"
+                    className="w-full bg-zinc-800 border border-amber-500/30 rounded-lg px-3.5 py-2.5 text-white text-sm
+                               placeholder-zinc-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 transition"
+                  />
+                </div>
+              )}
 
               {formError && (
                 <div className="px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
