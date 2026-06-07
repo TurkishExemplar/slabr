@@ -108,6 +108,10 @@ BEGIN
     CHECK (source IN ('ebay','ximilar','mock','manual'));
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
+
+-- Phase 12: password reset
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;
 `;
 
 async function migrate() {
