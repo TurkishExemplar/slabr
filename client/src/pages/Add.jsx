@@ -383,7 +383,7 @@ export default function Add() {
                 type="text"
                 value={query}
                 onChange={e => { setQuery(e.target.value); setManualMode(false); }}
-                placeholder="Search any card — LeBron James, Ben Simmons rookie…"
+                placeholder="Search any card, player, or set…"
                 autoFocus
                 className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-10 pr-4 py-3 text-white text-sm
                            placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition"

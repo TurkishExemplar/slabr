@@ -177,27 +177,53 @@ function pickBestImage(items, name) {
   return (best ?? items[0])?.image?.imageUrl ?? null;
 }
 
-// Sealed-product titles that must never be used as a card image.
-// "set" is intentionally excluded — too common in card titles ("base set", etc.)
-const JUNK_IMAGE_RE = /\b(pack|box|lot|case|bundle|wrapper|wax|blaster|hobby)\b/i;
+// Sealed/non-card keywords that disqualify a listing as a card image source.
+const JUNK_IMAGE_RE = /\b(pack|box|lot|case|sealed|set|bundle|wrapper|wax|blaster|hobby)\b/i;
 
-// Dedicated image search — uses a clean (grade-free) query so we pick up
-// both raw card and graded-slab photos, then aggressively filters out
-// packs, boxes, and other sealed merchandise before selecting the best image.
-// Returns null on error so callers can skip the image update gracefully.
+// Dedicated image search — completely separate from the price search so we can
+// use a clean, non-graded query and apply strict per-result validation.
+//
+// Selection rules (all must pass):
+//   1. Title must NOT contain junk keywords (pack, box, lot, case, sealed, set…)
+//   2. Title must contain every significant word of the card/player name
+//   3. Image URL must end in .jpg / .jpeg / .png (not a placeholder or webp)
+// Returns null if no result passes all three checks — better to show nothing
+// than to save an image of a plastic pack.
 async function fetchCardImage(item) {
   const { name, year, set_name, card_number } = item;
-  const q = [name, year, set_name, card_number].filter(Boolean).join(' ');
+  // Appending "card" nudges eBay's ranking toward individual card listings.
+  const q = [name, year, set_name, card_number, 'card'].filter(Boolean).join(' ');
+
+  // Name parts used for title matching (skip short words like "Jr", "de")
+  const nameParts = (name ?? '').toLowerCase().split(/\s+/).filter(p => p.length > 2);
+
   try {
     const data = await ebayGet('/buy/browse/v1/item_summary/search', {
       q,
-      limit:  10,
+      limit:  15,
       sort:   'newlyListed',
       filter: 'buyingOptions:{FIXED_PRICE}',
     });
-    const valid = (data.itemSummaries ?? []).filter(i => !JUNK_IMAGE_RE.test(i.title ?? ''));
-    console.log(`[ebay] fetchCardImage "${q}": ${data.itemSummaries?.length ?? 0} raw → ${valid.length} after junk filter`);
-    return pickBestImage(valid, name);
+
+    for (const listing of data.itemSummaries ?? []) {
+      const title  = (listing.title ?? '').toLowerCase();
+      const imgUrl = listing.image?.imageUrl ?? '';
+
+      // Rule 1: no sealed product / lot / set in the title
+      if (JUNK_IMAGE_RE.test(title)) continue;
+
+      // Rule 2: title must contain the player/card name
+      if (nameParts.length > 0 && !nameParts.every(p => title.includes(p))) continue;
+
+      // Rule 3: real image file (not a CDN placeholder or webp thumbnail)
+      if (!/\.(jpg|jpeg|png)(\?.*)?$/i.test(imgUrl)) continue;
+
+      console.log(`[ebay] fetchCardImage selected: "${listing.title}"`);
+      return imgUrl;
+    }
+
+    console.log(`[ebay] fetchCardImage: no clean image found for "${q}" — leaving image_url unchanged`);
+    return null;
   } catch (err) {
     console.error(`[ebay] fetchCardImage failed: ${err.message}`);
     return null;
