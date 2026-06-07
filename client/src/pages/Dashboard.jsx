@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
 import {
   LineChart, Line, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -74,6 +74,7 @@ function effectiveValue(item) {
 export default function Dashboard() {
   const { user, token, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [items, setItems] = useState([]);
   const [history, setHistory] = useState([]);
@@ -82,9 +83,33 @@ export default function Dashboard() {
 
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [conditionFilter, setConditionFilter] = useState('all');
+  const [sortKey, setSortKey] = useState('date');
 
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState(null); // { type: 'ok'|'warn'|'error', text }
+
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  // Online/offline detection
+  useEffect(() => {
+    const goOn  = () => setIsOnline(true);
+    const goOff = () => setIsOnline(false);
+    window.addEventListener('online',  goOn);
+    window.addEventListener('offline', goOff);
+    return () => {
+      window.removeEventListener('online',  goOn);
+      window.removeEventListener('offline', goOff);
+    };
+  }, []);
+
+  // Success toast when navigating back from Add page
+  useEffect(() => {
+    if (location.state?.added) {
+      setRefreshMsg({ type: 'ok', text: 'Item added to portfolio' });
+      setTimeout(() => setRefreshMsg(null), 3000);
+      window.history.replaceState({}, '');
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
@@ -174,11 +199,33 @@ export default function Dashboard() {
       .map(([type, value]) => ({ name: CATEGORY_LABELS[type] ?? type, value, type }));
   }, [items]);
 
-  const filteredItems = useMemo(() => items.filter(item => {
-    if (categoryFilter !== 'all' && item.item_type !== categoryFilter) return false;
-    if (conditionFilter !== 'all' && item.condition !== conditionFilter) return false;
-    return true;
-  }), [items, categoryFilter, conditionFilter]);
+  const filteredItems = useMemo(() => {
+    const list = items.filter(item => {
+      if (categoryFilter !== 'all' && item.item_type !== categoryFilter) return false;
+      if (conditionFilter !== 'all' && item.condition !== conditionFilter) return false;
+      return true;
+    });
+
+    return [...list].sort((a, b) => {
+      switch (sortKey) {
+        case 'value_desc':
+          return effectiveValue(b) * b.quantity - effectiveValue(a) * a.quantity;
+        case 'value_asc':
+          return effectiveValue(a) * a.quantity - effectiveValue(b) * b.quantity;
+        case 'name':
+          return (a.name ?? '').localeCompare(b.name ?? '');
+        case 'gain': {
+          const gA = a.purchase_price != null
+            ? (effectiveValue(a) - parseFloat(a.purchase_price)) * a.quantity : -Infinity;
+          const gB = b.purchase_price != null
+            ? (effectiveValue(b) - parseFloat(b.purchase_price)) * b.quantity : -Infinity;
+          return gB - gA;
+        }
+        default: // 'date' — API already returns newest first
+          return 0;
+      }
+    });
+  }, [items, categoryFilter, conditionFilter, sortKey]);
 
   function handleLogout() {
     logout();
@@ -187,8 +234,37 @@ export default function Dashboard() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-[#09090b] flex items-center justify-center">
-        <span className="text-zinc-500 text-sm">Loading portfolio…</span>
+      <div className="min-h-screen bg-[#09090b]">
+        <header className="border-b border-zinc-800 h-14" />
+        <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+          <div>
+            <div className="h-7 w-28 bg-zinc-800 rounded-lg animate-pulse" />
+            <div className="h-3.5 w-14 bg-zinc-800 rounded mt-2.5 animate-pulse" />
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            {[...Array(4)].map((_, i) => (
+              <div key={i} className="bg-zinc-900 border border-zinc-800 rounded-2xl px-5 py-4 space-y-3">
+                <div className="h-3 w-20 bg-zinc-800 rounded animate-pulse" />
+                <div className="h-6 w-24 bg-zinc-800 rounded animate-pulse" />
+              </div>
+            ))}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            {[...Array(8)].map((_, i) => (
+              <div key={i} className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+                <div className="aspect-[4/3] bg-zinc-800 animate-pulse" />
+                <div className="p-4 space-y-3">
+                  <div className="h-3 w-14 bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-4 w-full bg-zinc-800 rounded animate-pulse" />
+                  <div className="h-3 w-2/3 bg-zinc-800 rounded animate-pulse" />
+                  <div className="pt-2 border-t border-zinc-800">
+                    <div className="h-5 w-20 bg-zinc-800 rounded animate-pulse" />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </main>
       </div>
     );
   }
@@ -203,6 +279,13 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-[#09090b]">
+      {/* Offline banner */}
+      {!isOnline && (
+        <div className="bg-amber-500/10 border-b border-amber-500/20 py-2 px-4 text-center text-amber-400 text-xs">
+          You're offline — prices and search won't update until you reconnect
+        </div>
+      )}
+
       {/* Nav */}
       <header className="border-b border-zinc-800 sticky top-0 bg-[#09090b]/95 backdrop-blur z-10">
         <div className="max-w-7xl mx-auto px-6 h-14 flex items-center justify-between">
@@ -425,6 +508,20 @@ export default function Dashboard() {
                 {filteredItems.length} of {items.length}
               </span>
             )}
+
+            {/* Sort */}
+            <select
+              value={sortKey}
+              onChange={e => setSortKey(e.target.value)}
+              className="ml-auto bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2 text-xs text-zinc-400
+                         focus:outline-none focus:border-indigo-500 transition appearance-none cursor-pointer"
+            >
+              <option value="date">Date Added</option>
+              <option value="value_desc">Value ↓</option>
+              <option value="value_asc">Value ↑</option>
+              <option value="name">Name A–Z</option>
+              <option value="gain">Gain ↓</option>
+            </select>
           </div>
         )}
 
@@ -475,6 +572,7 @@ function StatCard({ label, value, sub, positive }) {
 }
 
 function ItemCard({ item }) {
+  const [imgLoaded, setImgLoaded] = useState(false);
   const value = effectiveValue(item);
   const cost  = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
   const totalValue = value * item.quantity;
@@ -486,11 +584,23 @@ function ItemCard({ item }) {
   return (
     <Link to={`/item/${item.id}`} className="block bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden hover:border-zinc-700 transition">
       {/* Thumbnail */}
-      <div className="aspect-[4/3] bg-zinc-800 flex items-center justify-center">
-        {item.image_url
-          ? <img src={item.image_url} alt={item.name} className="w-full h-full object-contain p-4" />
-          : <ItemIcon type={item.item_type} />
-        }
+      <div className="aspect-[4/3] bg-zinc-800 flex items-center justify-center relative overflow-hidden">
+        {item.image_url ? (
+          <>
+            {!imgLoaded && (
+              <div className="absolute inset-0 bg-zinc-800 animate-pulse" />
+            )}
+            <img
+              src={item.image_url}
+              alt={item.name}
+              loading="lazy"
+              onLoad={() => setImgLoaded(true)}
+              className={`w-full h-full object-contain p-4 transition-opacity duration-300 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+            />
+          </>
+        ) : (
+          <ItemIcon type={item.item_type} />
+        )}
       </div>
 
       {/* Body */}

@@ -180,7 +180,7 @@ export default function Add() {
         body: JSON.stringify(body),
       });
       if (!res.ok) { const d = await res.json(); setScanSubmitError(d.error || 'Failed to add item'); return; }
-      navigate('/dashboard');
+      navigate('/dashboard', { state: { added: true } });
     } catch {
       setScanSubmitError('Network error — is the server running?');
     } finally {
@@ -312,7 +312,7 @@ export default function Add() {
         body: JSON.stringify(body),
       });
       if (!res.ok) { const d = await res.json(); setFormError(d.error || 'Failed to add item'); return; }
-      navigate('/dashboard');
+      navigate('/dashboard', { state: { added: true } });
     } catch {
       setFormError('Network error — is the server running?');
     } finally {
