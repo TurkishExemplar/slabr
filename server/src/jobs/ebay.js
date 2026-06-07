@@ -317,4 +317,58 @@ async function runEbayJob() {
   return result;
 }
 
-module.exports = { runEbayJob };
+// ── Catalog search helper (used by GET /api/catalog/search) ──────────────────
+//
+// Returns up to `limit` eBay results mapped to the catalog item shape:
+//   { source, ebay_item_id, name, item_type, year, set_name,
+//     image_url, current_value, condition }
+
+function inferItemType(item) {
+  const title = (item.title ?? '').toLowerCase();
+  const cats  = (item.categories ?? []).map(c => (c.categoryName ?? '').toLowerCase());
+  if (cats.some(c => /tcg|pokemon|magic.*gathering|yugioh|trading card game/.test(c))) return 'tcg';
+  if (cats.some(c => c.includes('comic'))) return 'comic';
+  if (cats.some(c => c.includes('sealed')) || /sealed box|sealed pack/.test(title)) return 'sealed';
+  return 'sports_card';
+}
+
+async function ebaySearch(query, limit = 25) {
+  const token  = await getToken();
+  const env    = (process.env.EBAY_ENV ?? 'production').toLowerCase();
+  const base   = API_BASE[env] ?? API_BASE.production;
+  const params = new URLSearchParams({
+    q:      query,
+    limit:  String(Math.min(limit, 50)),
+    filter: 'buyingOptions:{FIXED_PRICE}',
+    sort:   'newlyListed',
+  });
+
+  const res = await fetch(`${base}/buy/browse/v1/item_summary/search?${params}`, {
+    headers: {
+      Authorization:             `Bearer ${token}`,
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      'X-EBAY-C-ENDUSERCTX':    'contextualLocation=country=US',
+    },
+    signal: AbortSignal.timeout(12_000),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`eBay search HTTP ${res.status}: ${text.slice(0, 160)}`);
+  }
+
+  const data = await res.json();
+  return (data.itemSummaries ?? []).map(item => ({
+    source:        'ebay',
+    ebay_item_id:  item.itemId,
+    name:          item.title,
+    item_type:     inferItemType(item),
+    year:          null,
+    set_name:      null,
+    image_url:     item.image?.imageUrl ?? null,
+    current_value: item.price?.value != null ? parseFloat(item.price.value) : null,
+    condition:     item.condition ?? null,
+  }));
+}
+
+module.exports = { runEbayJob, ebaySearch };

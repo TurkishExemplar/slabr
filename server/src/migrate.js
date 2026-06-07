@@ -94,6 +94,12 @@ CREATE TABLE IF NOT EXISTS comparable_sales (
   recorded_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Phase 9: eBay item ID for eBay-sourced catalog entries
+ALTER TABLE master_catalog ADD COLUMN IF NOT EXISTS ebay_item_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS master_catalog_ebay_item_id_idx
+  ON master_catalog(ebay_item_id)
+  WHERE ebay_item_id IS NOT NULL;
+
 -- Expand price_history source constraint to include 'manual'
 DO $$
 BEGIN
