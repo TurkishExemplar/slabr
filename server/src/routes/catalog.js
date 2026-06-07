@@ -20,8 +20,40 @@ router.get('/search', async (req, res) => {
   if (hasEbay) {
     try {
       const { ebaySearch } = require('../jobs/ebay');
-      const items = await ebaySearch(q, 25);
-      return res.json(items);
+
+      // Run eBay search and local catalog lookup in parallel.
+      // Local results take priority — if a card already exists in master_catalog
+      // we show that version so the user adds to the existing catalog entry
+      // rather than creating a duplicate.
+      const [ebayItems, localRes] = await Promise.all([
+        ebaySearch(q, 30),
+        pool.query(`
+          SELECT id, item_type, name, year, brand_publisher, set_name,
+                 card_number, variation, sport_game, rarity, image_url
+          FROM master_catalog
+          WHERE name           ILIKE $1
+             OR set_name        ILIKE $1
+             OR brand_publisher ILIKE $1
+          ORDER BY name
+          LIMIT 10
+        `, [`%${q}%`]),
+      ]);
+
+      const local = localRes.rows.map(r => ({ ...r, source: 'local' }));
+
+      // Build a set of title prefixes that are already covered by local entries.
+      // Any eBay result whose 40-char title prefix matches a local entry is
+      // suppressed — the user will see the local version instead.
+      const localKeys = new Set(
+        local.map(r => (r.name ?? '').toLowerCase().slice(0, 40))
+      );
+      const freshEbay = ebayItems.filter(e =>
+        !localKeys.has((e.name ?? '').toLowerCase().slice(0, 40))
+      );
+
+      // Local entries first so the user sees familiar/saved cards at the top.
+      const merged = [...local, ...freshEbay].slice(0, 25);
+      return res.json(merged);
     } catch (err) {
       console.error('[catalog search] eBay error, falling back to local:', err.message);
       // fall through to local search

@@ -530,7 +530,13 @@ const CARD_CATEGORY_IDS = '212,183454,259104,183456';
 // Title patterns that definitively indicate non-card merchandise.
 // Applied as a client-side safety net after eBay's category filter.
 const REJECT_TITLE_RE =
-  /\b(t-shirt|hoodie|sweatshirt|sneaker|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat\b|cap\b|pants\b|jacket\b)\b/i;
+  /\b(t-shirt|hoodie|sweatshirt|sneaker|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let))\b|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+photo/i;
+
+// Whitelisted TCG game names.  Any result classified as 'tcg' must match
+// at least one of these or it is filtered out (blocks unknown or inappropriate
+// TCG content from eBay's CCG category).
+const TCG_GAME_RE =
+  /\b(pokemon|pok[eé]mon|magic|m\.?t\.?g\.?|yu[-\s]?gi[-\s]?oh|yugioh|one\s+piece|dragon\s+ball|lorcana|flesh\s+and\s+blood|digimon|naruto|final\s+fantasy)\b/i;
 
 async function ebaySearch(query, limit = 25) {
   const token = await getToken();
@@ -578,13 +584,11 @@ async function ebaySearch(query, limit = 25) {
   const data  = await res.json();
   const raw   = data.itemSummaries ?? [];
 
-  // ── Client-side safety filter ─────────────────────────────────────────────
-  // Removes any items that slipped through with obviously non-card titles.
-  const clean = raw.filter(item => !REJECT_TITLE_RE.test(item.title ?? ''));
+  // ── Step 1: reject non-card merchandise ──────────────────────────────────
+  const afterJunk = raw.filter(item => !REJECT_TITLE_RE.test(item.title ?? ''));
 
-  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${clean.length} after title filter`);
-
-  return clean.map(item => ({
+  // ── Step 2: map to catalog shape ──────────────────────────────────────────
+  const mapped = afterJunk.map(item => ({
     source:        'ebay',
     ebay_item_id:  item.itemId,
     name:          item.title,
@@ -595,6 +599,36 @@ async function ebaySearch(query, limit = 25) {
     current_value: item.price?.value != null ? parseFloat(item.price.value) : null,
     condition:     item.condition ?? null,
   }));
+
+  // ── Step 3: TCG whitelist — only pass known popular games ─────────────────
+  // Prevents unknown, adult-themed, or irrelevant CCG results from slipping
+  // through the category filter.
+  const afterTcg = mapped.filter(item => {
+    if (item.item_type !== 'tcg') return true;   // non-TCG items pass through
+    return TCG_GAME_RE.test(item.name ?? '');
+  });
+
+  // ── Step 4: deduplicate by title prefix (first 40 chars, lowercased) ──────
+  // eBay often returns near-identical listings for the same card (different
+  // sellers, same title).  Keep the first occurrence — eBay sorts by relevance
+  // so the first is the most relevant.  Prefer items with a real image.
+  const sorted = afterTcg.sort((a, b) => {
+    // Move items with an image URL to the front before deduping
+    const aHasImg = a.image_url ? 1 : 0;
+    const bHasImg = b.image_url ? 1 : 0;
+    return bHasImg - aHasImg;
+  });
+  const seen  = new Set();
+  const clean = sorted.filter(item => {
+    const key = (item.name ?? '').toLowerCase().slice(0, 40);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterJunk.length} after junk → ${afterTcg.length} after TCG filter → ${clean.length} after dedup`);
+
+  return clean;
 }
 
 // ── Instant single-item pricer (called right after a portfolio add) ───────────
