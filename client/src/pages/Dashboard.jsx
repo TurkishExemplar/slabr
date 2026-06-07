@@ -43,9 +43,10 @@ const PRICE_SOURCE_STYLE = {
   ximilar: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
   manual:  'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:    'bg-zinc-500/10 text-zinc-500 border-zinc-700',
+  none:    'bg-zinc-500/10 text-zinc-600 border-zinc-800',
 };
 
-const PRICE_SOURCE_LABEL = { ebay: 'eBay', ximilar: 'Ximilar', manual: 'Owner Est.', mock: 'Mock Data' };
+const PRICE_SOURCE_LABEL = { ebay: 'eBay', ximilar: 'Ximilar', manual: 'Owner Est.', mock: 'Mock Data', none: 'Not priced' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -62,11 +63,16 @@ function fmtDate(str) {
   return new Date(str).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
+// Returns the best available price, or null when no real price data exists.
+// Callers that need a numeric fallback should use (effectiveValue(item) ?? 0).
 function effectiveValue(item) {
   if (item.is_one_of_one && item.manual_value != null) {
     return parseFloat(item.manual_value);
   }
-  return parseFloat(item.current_value ?? item.ph_value ?? 0);
+  const raw = item.current_value ?? item.ph_value;
+  if (raw == null) return null;
+  const v = parseFloat(raw);
+  return !isNaN(v) && v > 0 ? v : null;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -215,10 +221,12 @@ export default function Dashboard() {
         case 'name':
           return (a.name ?? '').localeCompare(b.name ?? '');
         case 'gain': {
-          const gA = a.purchase_price != null
-            ? (effectiveValue(a) - parseFloat(a.purchase_price)) * a.quantity : -Infinity;
-          const gB = b.purchase_price != null
-            ? (effectiveValue(b) - parseFloat(b.purchase_price)) * b.quantity : -Infinity;
+          const evA = effectiveValue(a);
+          const evB = effectiveValue(b);
+          const gA = a.purchase_price != null && evA != null
+            ? (evA - parseFloat(a.purchase_price)) * a.quantity : -Infinity;
+          const gB = b.purchase_price != null && evB != null
+            ? (evB - parseFloat(b.purchase_price)) * b.quantity : -Infinity;
           return gB - gA;
         }
         default: // 'date' — API already returns newest first
@@ -573,13 +581,15 @@ function StatCard({ label, value, sub, positive }) {
 
 function ItemCard({ item }) {
   const [imgLoaded, setImgLoaded] = useState(false);
-  const value = effectiveValue(item);
-  const cost  = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
-  const totalValue = value * item.quantity;
-  const totalCost  = cost != null ? cost * item.quantity : null;
-  const gain       = totalCost != null ? totalValue - totalCost : null;
+  const value      = effectiveValue(item);                              // null when no real price
+  const cost       = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
+  const totalValue = value != null ? value * item.quantity : null;      // null → shows "—"
+  const totalCost  = cost  != null ? cost  * item.quantity : null;
+  // Only calculate gain when we have a real current value — avoids showing a
+  // misleading negative number when the card hasn't been priced yet.
+  const gain       = totalValue != null && totalCost != null ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
-  const src        = item.is_one_of_one ? 'manual' : (item.price_source ?? 'mock');
+  const src        = item.is_one_of_one ? 'manual' : (item.price_source ?? 'none');
 
   return (
     <Link to={`/item/${item.id}`} className="block bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden hover:border-zinc-700 transition">

@@ -181,9 +181,15 @@ export default function Item() {
   );
 
   const isOneOfOne  = item.is_one_of_one === true;
-  const displayValue = isOneOfOne
-    ? (item.manual_value != null ? parseFloat(item.manual_value) : null)
-    : parseFloat(item.current_value ?? item.ph_value ?? 0);
+  // Return null (not 0) when no real price data — lets downstream gain/loss
+  // display "—" instead of a misleading negative number.
+  const displayValue = (() => {
+    if (isOneOfOne) return item.manual_value != null ? parseFloat(item.manual_value) : null;
+    const raw = item.current_value ?? item.ph_value;
+    if (raw == null) return null;
+    const v = parseFloat(raw);
+    return !isNaN(v) && v > 0 ? v : null;
+  })();
   const cost       = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
   const totalValue = displayValue != null ? displayValue * item.quantity : null;
   const totalCost  = cost != null ? cost * item.quantity : null;
