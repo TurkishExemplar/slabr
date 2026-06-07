@@ -106,7 +106,9 @@ function buildQuery(item) {
 
   switch (item_type) {
     case 'sports_card':
-      return [name, year, set_name, gradeStr].filter(Boolean).join(' ');
+      // card_number added so "Stephen Curry 2009 Topps 321 PSA 9" is
+      // specific enough to match the slab, not the raw base set card.
+      return [name, year, set_name, card_number, gradeStr].filter(Boolean).join(' ');
     case 'tcg':
       return [name, set_name, card_number, gradeStr].filter(Boolean).join(' ');
     case 'comic':
@@ -118,17 +120,47 @@ function buildQuery(item) {
   }
 }
 
-// Loose query for sold-price searches — strips grade/condition so we don't
-// over-specify and get zero results from Marketplace Insights.
+// Loose query for the sold-price fallback search.
+// For GRADED items we keep the grading company + grade even in the loose query —
+// dropping them would match raw ($10) copies instead of slabs ($4,000).
+// We only relax by dropping set_name and card_number.
 function buildSoldQuery(item) {
-  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher } = item;
+  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade } = item;
+  const gradeStr = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
+
   switch (item_type) {
-    case 'sports_card': return [name, year, set_name].filter(Boolean).join(' ');
-    case 'tcg':         return [name, set_name, card_number].filter(Boolean).join(' ');
-    case 'comic':       return [name, card_number ? `#${card_number}` : '', brand_publisher].filter(Boolean).join(' ');
+    case 'sports_card': return [name, year, gradeStr].filter(Boolean).join(' ');
+    case 'tcg':         return [name, gradeStr].filter(Boolean).join(' ');
+    case 'comic':       return [name, brand_publisher, gradeStr].filter(Boolean).join(' ');
     case 'sealed':      return [name, year, sport_game, 'sealed'].filter(Boolean).join(' ');
-    default:            return [name, year, set_name].filter(Boolean).join(' ');
+    default:            return [name, year, gradeStr].filter(Boolean).join(' ');
   }
+}
+
+// ── Grade-aware result filters ────────────────────────────────────────────────
+
+// Keep only items whose title includes "<COMPANY> <GRADE>" (e.g. "PSA 9").
+// Prevents raw copies from contaminating the price sample for graded cards.
+// gradeFilter: { company: 'PSA', grade: '9' }  — pass null for raw items.
+function filterByGradeTag(items, gradeFilter, titleField = 'title') {
+  if (!gradeFilter?.company) return items;
+  const tag = `${gradeFilter.company} ${gradeFilter.grade ?? ''}`.trim().toUpperCase();
+  return items.filter(i => (i[titleField] ?? '').toUpperCase().includes(tag));
+}
+
+// Pick the best image from a list of eBay listing summaries.
+// Prefers a listing whose title contains all significant words of the card name
+// so we don't end up showing a pack image or the wrong player.
+function pickBestImage(items, name) {
+  if (!items.length) return null;
+  if (!name) return items[0]?.image?.imageUrl ?? null;
+  // Significant words: length > 2 chars (skips "Jr", "De", etc.)
+  const parts = name.toLowerCase().split(/\s+/).filter(p => p.length > 2);
+  if (!parts.length) return items[0]?.image?.imageUrl ?? null;
+  const best = items.find(i =>
+    parts.every(p => (i.title ?? '').toLowerCase().includes(p))
+  );
+  return (best ?? items[0])?.image?.imageUrl ?? null;
 }
 
 // Trim 10 % from each end, return median
@@ -153,16 +185,18 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 //   2. If scope isn't approved (403 / invalid_scope), fall back to Browse API
 //      active-listing prices as a market proxy so the chart is never empty.
 //
-async function fetchMarketPrices(specificKeywords, looseKeywords) {
+// gradeFilter: { company: 'PSA', grade: '9' } — applied as a title check on
+// every result set so raw copies never contaminate the price sample.
+async function fetchMarketPrices(specificKeywords, looseKeywords, gradeFilter = null) {
   // ── Attempt 1: Marketplace Insights (real sold data) ──────────────────────
   try {
-    console.log(`[ebay] Sold query (specific): "${specificKeywords}"`);
+    console.log(`[ebay] Sold query (specific): "${specificKeywords}"${gradeFilter ? ` [grade filter: ${gradeFilter.company} ${gradeFilter.grade}]` : ''}`);
     const data = await ebayGet('/buy/marketplace_insights/v1_beta/item_sales/search', {
       q:     specificKeywords,
       limit: 15,
       sort:  'newlyListed',
     });
-    let prices = (data.itemSales ?? [])
+    let prices = filterByGradeTag(data.itemSales ?? [], gradeFilter)
       .map(i => parseFloat(i.lastSoldPrice?.value))
       .filter(v => !isNaN(v) && v > 0);
     console.log(`[ebay] Sold results (specific): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
@@ -175,7 +209,7 @@ async function fetchMarketPrices(specificKeywords, looseKeywords) {
         limit: 15,
         sort:  'newlyListed',
       });
-      prices = (data2.itemSales ?? [])
+      prices = filterByGradeTag(data2.itemSales ?? [], gradeFilter)
         .map(i => parseFloat(i.lastSoldPrice?.value))
         .filter(v => !isNaN(v) && v > 0);
       console.log(`[ebay] Sold results (loose): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
@@ -195,6 +229,7 @@ async function fetchMarketPrices(specificKeywords, looseKeywords) {
   // ── Fallback: Browse API active-listing median ────────────────────────────
   // Uses active fixed-price listings as a market-value proxy.
   // Not as accurate as sold data but ensures sold_median is never null.
+  // gradeFilter applied here too so a PSA 9 never gets priced from raw listings.
   try {
     const q = looseKeywords || specificKeywords;
     console.log(`[ebay] Active-price fallback query: "${q}"`);
@@ -204,7 +239,7 @@ async function fetchMarketPrices(specificKeywords, looseKeywords) {
       sort:   'price',
       filter: 'buyingOptions:{FIXED_PRICE}',
     });
-    const prices = (data.itemSummaries ?? [])
+    const prices = filterByGradeTag(data.itemSummaries ?? [], gradeFilter)
       .map(i => parseFloat(i.price?.value))
       .filter(v => !isNaN(v) && v > 0);
     console.log(`[ebay] Active fallback results: ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
@@ -216,24 +251,34 @@ async function fetchMarketPrices(specificKeywords, looseKeywords) {
 }
 
 // Active low (Fixed Price) via Browse API.
-// Returns { activeLow, imageUrl } — imageUrl is the first listing's image so
-// priceSingleItem can replace a temporary scan photo with a real eBay CDN URL.
-async function fetchActiveLow(keywords) {
+// Returns { activeLow, imageUrl } — imageUrl is used to replace a temporary
+// scan photo with a real eBay CDN URL.
+//
+// gradeFilter: { company, grade } — keeps only graded-slab listings.
+// itemName: card name (e.g. "Stephen Curry") — used to pick the best image
+//   from the filtered results so we don't accidentally show a pack image.
+async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
   const data = await ebayGet('/buy/browse/v1/item_summary/search', {
     q:      keywords,
-    limit:  5,
+    limit:  10,          // fetch more so we have a good pool after title filtering
     sort:   'price',
     filter: 'buyingOptions:{FIXED_PRICE}',
   });
 
-  const items  = data.itemSummaries ?? [];
+  const raw    = data.itemSummaries ?? [];
+  // Keep only listings whose title contains the grading company + grade
+  // (e.g. "PSA 9") — prevents a $10 raw card from becoming the active-low
+  // or providing the wrong image.
+  const items  = filterByGradeTag(raw, gradeFilter);
   const prices = items
     .map(i => parseFloat(i.price?.value))
     .filter(v => !isNaN(v) && v > 0);
 
   return {
     activeLow: prices.length ? Math.min(...prices) : null,
-    imageUrl:  items[0]?.image?.imageUrl ?? null,
+    // Prefer an image from a listing that names the card/player to avoid
+    // showing a pack, wrapper, or completely unrelated item.
+    imageUrl:  pickBestImage(items.length ? items : raw, itemName),
   };
 }
 
@@ -299,13 +344,17 @@ async function runEbayJob() {
       const keywords      = buildQuery(combo);
       const soldKeywords  = buildSoldQuery(combo);
       const isOneOfOne    = combo.is_one_of_one === true;
+      // Grade filter ensures results are slabs, not raw copies, for graded items.
+      const gradeFilter   = combo.condition === 'graded' && combo.grading_company
+        ? { company: combo.grading_company, grade: combo.grade }
+        : null;
 
       let soldMedian = null;
       let activeLow  = null;
 
       // Market prices (skip for 1/1)
       if (!isOneOfOne) {
-        const prices = await fetchMarketPrices(keywords, soldKeywords);
+        const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
         soldMedian   = computeMedian(prices);
         console.log(`[ebay-job] ${combo.name} | sold/proxy median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
         await sleep(400);
@@ -314,7 +363,7 @@ async function runEbayJob() {
       }
 
       // Active low (imageUrl unused in bulk job — priceSingleItem handles image updates)
-      ({ activeLow } = await fetchActiveLow(keywords));
+      ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name));
       console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
       await sleep(400);
 
@@ -512,18 +561,22 @@ async function priceSingleItem(catalogId, condition, grade) {
   const keywords     = buildQuery(catalogRow);
   const soldKeywords = buildSoldQuery(catalogRow);
   const isOneOfOne   = catalogRow.is_one_of_one === true;
+  // Grade filter: ensures sold and active searches match graded slabs, not raw copies.
+  const gradeFilter  = condition === 'graded' && catalogRow.grading_company
+    ? { company: catalogRow.grading_company, grade }
+    : null;
 
-  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active query: "${keywords}" | sold query: "${soldKeywords}"`);
+  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active: "${keywords}" | sold: "${soldKeywords}"${gradeFilter ? ` | grade filter: ${gradeFilter.company} ${gradeFilter.grade}` : ''}`);
 
   let soldMedian = null;
   let activeLow  = null;
 
   if (!isOneOfOne) {
-    const prices = await fetchMarketPrices(keywords, soldKeywords);
+    const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
     soldMedian   = computeMedian(prices);
   }
 
-  const activeResult = await fetchActiveLow(keywords);
+  const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
   activeLow = activeResult.activeLow;
 
   // Replace a temporary scan-photo data URL with a real eBay CDN image.
