@@ -118,6 +118,19 @@ function buildQuery(item) {
   }
 }
 
+// Loose query for sold-price searches — strips grade/condition so we don't
+// over-specify and get zero results from Marketplace Insights.
+function buildSoldQuery(item) {
+  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher } = item;
+  switch (item_type) {
+    case 'sports_card': return [name, year, set_name].filter(Boolean).join(' ');
+    case 'tcg':         return [name, set_name, card_number].filter(Boolean).join(' ');
+    case 'comic':       return [name, card_number ? `#${card_number}` : '', brand_publisher].filter(Boolean).join(' ');
+    case 'sealed':      return [name, year, sport_game, 'sealed'].filter(Boolean).join(' ');
+    default:            return [name, year, set_name].filter(Boolean).join(' ');
+  }
+}
+
 // Trim 10 % from each end, return median
 function computeMedian(prices) {
   if (!prices.length) return null;
@@ -131,24 +144,74 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── eBay fetch helpers ────────────────────────────────────────────────────────
 
-// Sold prices via Marketplace Insights API (beta — requires buy.marketplace.insights scope)
-// Returns [] if the scope hasn't been granted yet; job still updates active_low.
-async function fetchSoldPrices(keywords) {
+// Fetch prices for sold-median calculation.
+//
+// Strategy:
+//   1. Try eBay Marketplace Insights API (real sold data).
+//      Requires buy.marketplace.insights scope — needs explicit eBay approval.
+//      If 0 results with specific query, retry with a looser query (no grade).
+//   2. If scope isn't approved (403 / invalid_scope), fall back to Browse API
+//      active-listing prices as a market proxy so the chart is never empty.
+//
+async function fetchMarketPrices(specificKeywords, looseKeywords) {
+  // ── Attempt 1: Marketplace Insights (real sold data) ──────────────────────
   try {
+    console.log(`[ebay] Sold query (specific): "${specificKeywords}"`);
     const data = await ebayGet('/buy/marketplace_insights/v1_beta/item_sales/search', {
-      q:     keywords,
+      q:     specificKeywords,
       limit: 15,
       sort:  'newlyListed',
     });
-    return (data.itemSales ?? [])
+    let prices = (data.itemSales ?? [])
       .map(i => parseFloat(i.lastSoldPrice?.value))
       .filter(v => !isNaN(v) && v > 0);
-  } catch (err) {
-    // Scope not approved yet — sold median stays null
-    if (err.message?.includes('invalid_scope') || err.message?.includes('403')) {
-      return [];
+    console.log(`[ebay] Sold results (specific): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
+
+    // Retry with loose query when specific returns nothing
+    if (prices.length === 0 && looseKeywords && looseKeywords !== specificKeywords) {
+      console.log(`[ebay] Sold query (loose): "${looseKeywords}"`);
+      const data2 = await ebayGet('/buy/marketplace_insights/v1_beta/item_sales/search', {
+        q:     looseKeywords,
+        limit: 15,
+        sort:  'newlyListed',
+      });
+      prices = (data2.itemSales ?? [])
+        .map(i => parseFloat(i.lastSoldPrice?.value))
+        .filter(v => !isNaN(v) && v > 0);
+      console.log(`[ebay] Sold results (loose): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
     }
-    throw err;
+
+    if (prices.length > 0) return prices;
+    // Fall through to Browse API fallback
+    console.log(`[ebay] Sold: 0 results from Marketplace Insights — using Browse API active prices as proxy`);
+  } catch (err) {
+    if (err.message?.includes('invalid_scope') || err.message?.includes('403')) {
+      console.log(`[ebay] Marketplace Insights scope not approved (buy.marketplace.insights requires eBay approval) — using Browse API active prices as proxy`);
+    } else {
+      console.error(`[ebay] Sold prices error: ${err.message} — falling back to Browse API`);
+    }
+  }
+
+  // ── Fallback: Browse API active-listing median ────────────────────────────
+  // Uses active fixed-price listings as a market-value proxy.
+  // Not as accurate as sold data but ensures sold_median is never null.
+  try {
+    const q = looseKeywords || specificKeywords;
+    console.log(`[ebay] Active-price fallback query: "${q}"`);
+    const data = await ebayGet('/buy/browse/v1/item_summary/search', {
+      q:      q,
+      limit:  10,
+      sort:   'price',
+      filter: 'buyingOptions:{FIXED_PRICE}',
+    });
+    const prices = (data.itemSummaries ?? [])
+      .map(i => parseFloat(i.price?.value))
+      .filter(v => !isNaN(v) && v > 0);
+    console.log(`[ebay] Active fallback results: ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
+    return prices;
+  } catch (err2) {
+    console.error(`[ebay] Active-price fallback failed: ${err2.message}`);
+    return [];
   }
 }
 
@@ -227,17 +290,18 @@ async function runEbayJob() {
 
   for (const combo of combos) {
     try {
-      const keywords   = buildQuery(combo);
-      const isOneOfOne = combo.is_one_of_one === true;
+      const keywords      = buildQuery(combo);
+      const soldKeywords  = buildSoldQuery(combo);
+      const isOneOfOne    = combo.is_one_of_one === true;
 
       let soldMedian = null;
       let activeLow  = null;
 
-      // Sold prices (skip for 1/1)
+      // Market prices (skip for 1/1)
       if (!isOneOfOne) {
-        const prices = await fetchSoldPrices(keywords);
+        const prices = await fetchMarketPrices(keywords, soldKeywords);
         soldMedian   = computeMedian(prices);
-        console.log(`[ebay-job] ${combo.name} | sold: ${prices.length} results, median: ${soldMedian ? '$' + soldMedian : '—'}`);
+        console.log(`[ebay-job] ${combo.name} | sold/proxy median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
         await sleep(400);
       } else {
         skippedOneOfOne++;
@@ -399,17 +463,18 @@ async function priceSingleItem(catalogId, condition, grade) {
 
   if (!rows.length) return null;
 
-  const catalogRow = { ...rows[0], condition, grade };
-  const keywords   = buildQuery(catalogRow);
-  const isOneOfOne = catalogRow.is_one_of_one === true;
+  const catalogRow   = { ...rows[0], condition, grade };
+  const keywords     = buildQuery(catalogRow);
+  const soldKeywords = buildSoldQuery(catalogRow);
+  const isOneOfOne   = catalogRow.is_one_of_one === true;
 
-  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — query: "${keywords}"`);
+  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active query: "${keywords}" | sold query: "${soldKeywords}"`);
 
   let soldMedian = null;
   let activeLow  = null;
 
   if (!isOneOfOne) {
-    const prices = await fetchSoldPrices(keywords);
+    const prices = await fetchMarketPrices(keywords, soldKeywords);
     soldMedian   = computeMedian(prices);
   }
   activeLow = await fetchActiveLow(keywords);
@@ -419,6 +484,7 @@ async function priceSingleItem(catalogId, condition, grade) {
       INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
       VALUES ($1, $2, $3, $4, $5, 'ebay')
     `, [catalogId, condition, grade, soldMedian, activeLow]);
+    console.log(`[pricing] price_history row inserted — catalog_id=${catalogId}, sold_median=${soldMedian != null ? '$'+soldMedian : 'null'}, active_low=${activeLow != null ? '$'+activeLow : 'null'}`);
 
     if (!isOneOfOne) {
       await pool.query(`
@@ -438,7 +504,7 @@ async function priceSingleItem(catalogId, condition, grade) {
     }
     console.log(`[pricing] Done — sold_median=${soldMedian != null ? '$'+soldMedian : '—'}, active_low=${activeLow != null ? '$'+activeLow : '—'}`);
   } else {
-    console.log(`[pricing] No prices found for "${keywords}"`);
+    console.log(`[pricing] No prices found for "${keywords}" — price_history row NOT inserted`);
   }
 
   return { soldMedian, activeLow };
