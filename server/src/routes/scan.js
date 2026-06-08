@@ -20,34 +20,55 @@ function itemTypeFromHint(hint) {
 }
 
 // Find an existing master_catalog row or auto-insert one.
-// scanImageBase64: full data-URL from the scan photo — used as a temporary
+// scanImageBase64: data-URL from the scan photo — stored as a temporary
 // image_url until priceSingleItem replaces it with a real eBay CDN image.
-// Only stored if the catalog entry has no image and the payload is ≤ 1 MB.
+//
+// Lookup strategy (most-specific → least-specific):
+//   1. name + set_name + year   — prevents matching a different card that shares
+//      only the player name (e.g. "Kobe Bryant" matching ANY Kobe catalog entry)
+//   2. name + set_name           — year not extracted from label
+//   3. full name only            — only safe when name includes set info
+//   4. auto-create               — nothing matched
 async function resolveCatalogId(fields, scanImageBase64 = null) {
   const { item_type, name, set_name, card_number, year, sport_game, rarity } = fields;
   if (!name) return null;
 
   let id = null;
 
-  // 1. Exact name match
-  let res = await pool.query(
-    'SELECT id FROM master_catalog WHERE name ILIKE $1 LIMIT 1',
-    [`%${name}%`]
-  );
-  if (res.rows.length) id = res.rows[0].id;
-
-  // 2. Name + set match
-  if (!id && set_name) {
-    res = await pool.query(
-      'SELECT id FROM master_catalog WHERE set_name ILIKE $1 AND card_number = $2 LIMIT 1',
-      [`%${set_name}%`, card_number]
+  // 1. Most specific: name + set_name + year
+  if (!id && set_name && year) {
+    const r = await pool.query(
+      `SELECT id FROM master_catalog
+       WHERE name ILIKE $1 AND set_name ILIKE $2 AND year = $3 LIMIT 1`,
+      [`%${name}%`, `%${set_name}%`, year]
     );
-    if (res.rows.length) id = res.rows[0].id;
+    if (r.rows.length) id = r.rows[0].id;
   }
 
-  // 3. Auto-create catalog entry from scan data
+  // 2. name + set_name (year not available)
+  if (!id && set_name) {
+    const r = await pool.query(
+      `SELECT id FROM master_catalog
+       WHERE name ILIKE $1 AND set_name ILIKE $2 LIMIT 1`,
+      [`%${name}%`, `%${set_name}%`]
+    );
+    if (r.rows.length) id = r.rows[0].id;
+  }
+
+  // 3. Full name only — only used when set_name is unavailable; the scan prompt
+  //    now returns a fully-qualified name ("Kobe Bryant 1996-97 E-X2000 Star Date
+  //    2000") so a player-only name match is an intentional last resort.
+  if (!id && !set_name) {
+    const r = await pool.query(
+      'SELECT id FROM master_catalog WHERE name ILIKE $1 LIMIT 1',
+      [`%${name}%`]
+    );
+    if (r.rows.length) id = r.rows[0].id;
+  }
+
+  // 4. Auto-create
   if (!id) {
-    res = await pool.query(
+    const r = await pool.query(
       `INSERT INTO master_catalog
          (item_type, name, year, set_name, card_number, sport_game, rarity)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -58,14 +79,15 @@ async function resolveCatalogId(fields, scanImageBase64 = null) {
         card_number ?? null, sport_game ?? null, rarity ?? null,
       ]
     );
-    id = res.rows[0].id;
+    id = r.rows[0].id;
   }
 
   // ── Temporary image from scan photo ──────────────────────────────────────
-  // Store the scan base64 as image_url so the card shows an image immediately.
-  // Skipped if the payload is > 1 MB (large raw camera photos) — eBay will
-  // provide a CDN-optimised image once priceSingleItem runs.
-  if (scanImageBase64 && id && scanImageBase64.length <= 1_000_000) {
+  // Store the scan photo as a data-URI so the card shows an image immediately.
+  // Accept up to 8 MB of base64 (covers standard phone-camera JPEGs at normal
+  // quality settings).  eBay's priceSingleItem job will overwrite this with a
+  // proper CDN URL once the background pricing run completes.
+  if (scanImageBase64 && id && scanImageBase64.length <= 8_000_000) {
     await pool.query(
       `UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL`,
       [scanImageBase64, id]
@@ -77,34 +99,59 @@ async function resolveCatalogId(fields, scanImageBase64 = null) {
 
 const SCAN_PROMPT = `You are a collectibles identification expert specializing in graded trading card slabs.
 
-Analyze this image and identify the item. Read all text on the label very carefully.
+Analyze this image carefully. Read EVERY word on the label verbatim — do not guess or paraphrase.
 
 Return ONLY a valid JSON object — no markdown, no code fences, no other text. Use exactly this shape:
 {
   "is_collectible": true,
   "item_type": "sports_card",
-  "name": "player or character name",
-  "set_name": "set or product name",
-  "year": 2021,
-  "card_number": "DT23",
-  "sport_game": "football",
+  "name": "Kobe Bryant 1996-97 E-X2000 Star Date 2000",
+  "set_name": "E-X2000 Star Date 2000",
+  "year": 1996,
+  "card_number": "3",
+  "sport_game": "basketball",
   "rarity": null,
   "condition": "graded",
-  "grading_company": "PSA",
-  "grade": "10",
-  "cert_number": "88813132",
+  "grading_company": "BGS",
+  "grade": "9.5",
+  "cert_number": "0009218832",
   "confidence": 0.95
 }
 
-Rules:
-- item_type: "sports_card" | "tcg" | "comic" | "sealed" | "other"
-- condition: "graded" if inside a slab, otherwise "raw"
-- grading_company: "PSA" | "BGS" | "CGC" | "SGC" | null
-- grade: exact grade text from label (e.g. "10", "9.5") or null
-- cert_number: the certification/serial number as a string, or null
-- year: 4-digit integer or null; card_number: just the code without "#"
-- confidence: 0.0–1.0 representing your certainty
-- If this is not a recognizable collectible, return { "is_collectible": false }`;
+Field rules — read these carefully:
+
+name:
+  Include the full card identity: player/character name + year + set name.
+  Example: "Kobe Bryant 1996-97 E-X2000 Star Date 2000", NOT just "Kobe Bryant".
+  For TCG: "Charizard 1999 Base Set", NOT just "Charizard".
+
+set_name:
+  Copy verbatim from the label. E.g. "E-X2000 Star Date 2000", "Topps Chrome", "Base Set".
+
+year:
+  The card's release year as a 4-digit integer. For a season range like "1996-97", use 1996.
+
+card_number:
+  Just the number/code without "#". E.g. "3", "111", "DT23".
+
+grading_company — CRITICAL, identify from visual cues:
+  - "PSA"  → PSA logo (blue/red), label says "PSA", "Professional Sports Authenticator"
+  - "BGS"  → Beckett logo, label says "BGS", "Beckett Grading Services", or "BECKETT"
+  - "CGC"  → CGC logo, label says "CGC", "Certified Guaranty Company"
+  - "SGC"  → SGC logo, label says "SGC", "Sportscard Guaranty"
+  - null   → ungraded / raw card
+
+grade:
+  Exact grade text from the label (e.g. "10", "9.5", "9"). null if ungraded.
+
+cert_number:
+  The certification or serial number printed on the label as a string. null if absent.
+
+item_type: "sports_card" | "tcg" | "comic" | "sealed" | "other"
+condition: "graded" if inside a slab/holder with a grade label, otherwise "raw"
+confidence: 0.0–1.0 representing your certainty
+
+If this is not a recognizable collectible, return { "is_collectible": false }`;
 
 // ── POST /api/scan ────────────────────────────────────────────────────────────
 router.post('/', scanLimiter, async (req, res) => {
