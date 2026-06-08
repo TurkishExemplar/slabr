@@ -180,6 +180,13 @@ function pickBestImage(items, name) {
 // Sealed/non-card keywords that disqualify a listing as a card image source.
 const JUNK_IMAGE_RE = /\b(pack|box|lot|case|sealed|set|bundle|wrapper|wax|blaster|hobby)\b/i;
 
+// Parallel/variation keywords that identify non-base parallels in eBay titles.
+// Used to reject listing images that show the wrong version of a card —
+// e.g. an X-Fractor or Refractor image for a catalog entry that is the base
+// Topps Chrome version.  If the catalog item's own name or set_name already
+// contains one of these terms it means the item IS that parallel, so we allow it.
+const PARALLEL_IMAGE_RE = /\b(refractor|x[-\s]?fractor|prizm|optic|mosaic|superfractor|parallel|ssp|short\s*print)\b/i;
+
 // Dedicated image search — completely separate from the price search so we can
 // use a clean, non-graded query and apply strict per-result validation.
 //
@@ -187,6 +194,9 @@ const JUNK_IMAGE_RE = /\b(pack|box|lot|case|sealed|set|bundle|wrapper|wax|blaste
 //   1. Title must NOT contain junk keywords (pack, box, lot, case, sealed, set…)
 //   2. Title must contain every significant word of the card/player name
 //   3. Image URL must end in .jpg / .jpeg / .png (not a placeholder or webp)
+//   4. If this catalog item is a base card (no parallel keyword in name/set_name),
+//      reject listings that contain parallel/variation keywords (Refractor,
+//      X-Fractor, Prizm, etc.) so we never show the wrong version of the card.
 // Returns null if no result passes all three checks — better to show nothing
 // than to save an image of a plastic pack.
 async function fetchCardImage(item) {
@@ -196,6 +206,12 @@ async function fetchCardImage(item) {
 
   // Name parts used for title matching (skip short words like "Jr", "de")
   const nameParts = (name ?? '').toLowerCase().split(/\s+/).filter(p => p.length > 2);
+
+  // Determine whether this catalog item is itself a parallel/variation.
+  // If not, rule 4 will reject eBay listings that are parallels so we don't
+  // accidentally display an X-Fractor image for a base Chrome card.
+  const itemIdentity   = `${name ?? ''} ${set_name ?? ''}`;
+  const itemIsParallel = PARALLEL_IMAGE_RE.test(itemIdentity);
 
   try {
     const data = await ebayGet('/buy/browse/v1/item_summary/search', {
@@ -217,6 +233,12 @@ async function fetchCardImage(item) {
 
       // Rule 3: real image file (not a CDN placeholder or webp thumbnail)
       if (!/\.(jpg|jpeg|png)(\?.*)?$/i.test(imgUrl)) continue;
+
+      // Rule 4: reject parallel listings for base-card queries.
+      // Prevents a "2003 Topps Chrome X-Fractor" image being used for the
+      // base "2003 Topps Chrome" entry.  Skipped when the item itself is a
+      // parallel (so "Topps Chrome Refractor" correctly gets a Refractor image).
+      if (!itemIsParallel && PARALLEL_IMAGE_RE.test(title)) continue;
 
       console.log(`[ebay] fetchCardImage selected: "${listing.title}"`);
       return imgUrl;
@@ -757,19 +779,18 @@ async function priceSingleItem(catalogId, condition, grade) {
   const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
   activeLow = activeResult.activeLow;
 
-  // Fetch the card image via a dedicated search that filters out packs, boxes,
-  // and other sealed merchandise.  fetchCardImage's three-rule filter guarantees
-  // any returned URL is a real card photo, so we always overwrite the existing
-  // image_url — this fixes the case where a wrong image was saved before the
-  // junk filter existed and the old WHERE (IS NULL OR LIKE 'data:%') would
-  // silently skip re-fetching it.
+  // Fetch a card image from eBay and store it — but ONLY if the catalog entry
+  // has no image yet.  This preserves user-uploaded scan photos: when someone
+  // scans their physical card the photo they took is saved as a data: URL and
+  // should remain the displayed image.  eBay images are a fallback for items
+  // that have no photo at all (manually added or scan photo was too large to save).
   const imageUrl = await fetchCardImage(catalogRow);
   if (imageUrl) {
     await pool.query(
-      'UPDATE master_catalog SET image_url = $1 WHERE id = $2',
+      'UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL',
       [imageUrl, catalogId]
     );
-    console.log(`[pricing] catalog image updated from eBay for catalog_id=${catalogId}`);
+    console.log(`[pricing] catalog image set from eBay for catalog_id=${catalogId}`);
   }
 
   if (soldMedian != null || activeLow != null) {
