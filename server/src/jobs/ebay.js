@@ -585,10 +585,20 @@ async function ebaySearch(query, limit = 25) {
   const env   = (process.env.EBAY_ENV ?? 'production').toLowerCase();
   const base  = API_BASE[env] ?? API_BASE.production;
 
-  // Always append "trading card" so eBay's relevance engine ranks card
-  // listings first.  This is the primary fix for queries like "jordan 1"
-  // returning Air Jordan sneakers — categoryIds alone doesn't force cards.
-  const base_q = `${query.trim()} trading card`;
+  // Append "trading card" to vague queries (e.g. "jordan 1") so eBay's
+  // relevance engine ranks card listings first instead of sneakers or car parts.
+  //
+  // EXCEPTION: skip the append when the user already typed an explicit card
+  // signal (grading company, major brand, card-number pattern).  Adding
+  // "trading card" to "LeBron James Topps Chrome PSA 10 111" makes eBay
+  // require ALL of those tokens AND "trading" AND "card" in the same title,
+  // which returns 0 raw results for even the most iconic cards.
+  const QUERY_CARD_SIGNAL_RE =
+    /\b(psa|bgs|sgc|cgc|topps|panini|bowman|donruss|fleer|upper\s*deck|chrome|prizm|refractor|optic|pokemon|pok[eé]mon|mtg|yugioh)\b|#\d+|\d+\/\d+/i;
+
+  const base_q = QUERY_CARD_SIGNAL_RE.test(query.trim())
+    ? query.trim()                          // already card-specific — don't over-constrain
+    : `${query.trim()} trading card`;       // vague query — nudge eBay toward cards
 
   // Negative keywords tell eBay's relevance engine to deprioritise junk.
   const q = `${base_q} -shirt -shoes -sneaker -clothing -apparel -jersey -funko -poster`;
