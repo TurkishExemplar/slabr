@@ -527,10 +527,33 @@ function inferItemType(item) {
 //   183456   — Sealed Trading Card Packs & Sets
 const CARD_CATEGORY_IDS = '212,183454,259104,183456';
 
+// Allowed eBay category IDs — used to reject results that slipped through
+// the categoryIds request filter.  Mirrors CARD_CATEGORY_IDS as a Set for O(1) lookup.
+//   212      — Sports Trading Cards
+//   183454   — CCG Individual Cards
+//   259104   — Comics
+//   183456   — Sealed Trading Card Packs & Sets
+const ALLOWED_CAT_IDS = new Set(['212', '183454', '259104', '183456']);
+
+// Returns true if the item belongs to a known card category (or has no category
+// data — eBay doesn't always populate this field, so we fail open).
+function hasValidCategory(item) {
+  const cats = item.categories ?? [];
+  if (!cats.length) return true;
+  return cats.some(c => ALLOWED_CAT_IDS.has(String(c.categoryId)));
+}
+
+// Storage/accessory words that indicate a card holder, sleeve, binder, or
+// case product rather than an actual card.  We block these UNLESS the title
+// also contains a grading company — e.g. "PSA 9 slab case" is a legitimate
+// graded card; a plain "card sleeve" or "binder" is not what we want to show.
+const STORAGE_WORD_RE = /\b(holder|sleeve|binder)\b|(?<!\w)case(?!\s*(?:study|base))/i;
+const GRADING_CO_RE   = /\b(psa|bgs|sgc|cgc)\b/i;
+
 // Title patterns that definitively indicate non-card merchandise.
 // Applied as a client-side safety net after eBay's category filter.
 const REJECT_TITLE_RE =
-  /\b(t-shirt|hoodie|sweatshirt|sneakers?|shoes?|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let)|liftgate|chevy|gmc|truck)\b|air\s+jordan|jordan\s+\d+\s*(mid|low|high|og|retro)\b|size\s+\d|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+(photo|jersey|shirt|print)/i;
+  /\b(t-shirt|hoodie|sweatshirt|sneakers?|shoes?|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|bra|lingerie|bikini|swimsuit|nsfw|waifu|ecchi|gravure|yeezy|plush|fender|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let)|liftgate|chevy|gmc|truck)\b|air\s+jordan|jordan\s+\d+\s*(mid|low|high|og|retro)\b|size\s+\d{1,2}\b|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+(photo|jersey|shirt|print)|anime\s+girl|idol\s+photo/i;
 
 // Whitelisted TCG game names.  Any result classified as 'tcg' must match
 // at least one of these or it is filtered out (blocks unknown or inappropriate
@@ -538,12 +561,24 @@ const REJECT_TITLE_RE =
 const TCG_GAME_RE =
   /\b(pokemon|pok[eé]mon|magic|m\.?t\.?g\.?|yu[-\s]?gi[-\s]?oh|yugioh|one\s+piece|dragon\s+ball|lorcana|flesh\s+and\s+blood|digimon|naruto|final\s+fantasy)\b/i;
 
-// Positive allowlist — at least one of these must appear in the title.
-// This is the main backstop against shoes, car parts, and other junk that
-// slips past the REJECT filter.  Every legitimate card listing will contain
-// at least one grading company, brand name, or card-specific term.
-const CARD_KEYWORD_RE =
-  /\b(card|psa|bgs|sgc|cgc|rookie|refractor|prizm|topps|panini|bowman|upper\s+deck|donruss|fleer|pokemon|pok[eé]mon|mtg|yu[-\s]?gi[-\s]?oh|yugioh)\b/i;
+// Positive context filter — every surviving result must contain at least one
+// sport, brand, grade, or game term.  This is the last-resort backstop after
+// REJECT_TITLE_RE; it kills adult-content listings that append "trading card"
+// to an otherwise unrelated title.
+//
+// Covers:
+//   • League abbreviations  : nba / nfl / mlb / nhl / mls
+//   • Sports by name        : basketball, football, baseball, soccer, hockey
+//   • Card-specific terms   : rookie, refractor, prizm, auto, patch, card
+//   • Grading companies     : psa, bgs, sgc, cgc
+//   • Serial number patterns: /10  /25  /50  /99  /100 … /299  and  #/N
+//   • Card manufacturers    : topps, panini, bowman, donruss, fleer, score,
+//                             leaf, upper deck
+//   • TCG titles            : pokemon, pikachu, charizard, mtg,
+//                             magic the gathering, yugioh, one piece,
+//                             dragon ball, lorcana
+const CONTENT_CONTEXT_RE =
+  /\b(nba|nfl|mlb|nhl|mls|basketball|football|baseball|soccer|hockey|rookie|refractor|prizm|psa|bgs|sgc|cgc|panini|topps|bowman|donruss|fleer|score|leaf|pokemon|pok[eé]mon|pikachu|charizard|mtg|lorcana|yugioh|yu[-\s]?gi[-\s]?oh|card|auto|patch)\b|\bupper\s+deck\b|magic\s+the\s+gathering|one\s+piece|dragon\s+ball|#\/\d+|\/(10|25|50|99|100|149|199|249|299)\b/i;
 
 async function ebaySearch(query, limit = 25) {
   const token = await getToken();
@@ -590,8 +625,24 @@ async function ebaySearch(query, limit = 25) {
   const data  = await res.json();
   const raw   = data.itemSummaries ?? [];
 
+  // ── Step 0: category sanity check ────────────────────────────────────────
+  // If eBay returned category metadata on the result, reject anything outside
+  // the Sports/TCG/Comic/Sealed card universe.  When no categories field is
+  // present we fail open (true) so legitimate cards are never silently dropped.
+  const afterCat = raw.filter(item => hasValidCategory(item));
+
   // ── Step 1: reject non-card merchandise ──────────────────────────────────
-  const afterJunk = raw.filter(item => !REJECT_TITLE_RE.test(item.title ?? ''));
+  // Hard block-list of title patterns that definitively indicate clothing,
+  // adult content, automotive parts, toys, and storage accessories.
+  // Storage words (holder/sleeve/binder/case) are a separate conditional check:
+  // rejected unless the title also contains PSA/BGS/SGC/CGC, which indicates
+  // the "case" or "holder" is part of a graded-slab listing, not an accessory.
+  const afterJunk = afterCat.filter(item => {
+    const title = item.title ?? '';
+    if (REJECT_TITLE_RE.test(title)) return false;
+    if (STORAGE_WORD_RE.test(title) && !GRADING_CO_RE.test(title)) return false;
+    return true;
+  });
 
   // ── Step 2: map to catalog shape ──────────────────────────────────────────
   const mapped = afterJunk.map(item => ({
@@ -632,13 +683,14 @@ async function ebaySearch(query, limit = 25) {
     return true;
   });
 
-  // ── Step 5: require at least one card-specific keyword ────────────────────
-  // Final backstop — any listing that doesn't mention a grading company,
-  // card brand, or card-specific term (e.g. "rookie", "prizm") is not a card.
-  // Shoes, car parts, and signed photos all fail this check.
-  const clean = deduped.filter(item => CARD_KEYWORD_RE.test(item.name ?? ''));
+  // ── Step 5: require sport/game/brand context ─────────────────────────────
+  // Final backstop — every result must contain at least one sport league term,
+  // card brand, grading company, TCG title, or serial-number pattern.
+  // Adult-content items that append "trading card" to their title fail here
+  // because they carry none of those signals.
+  const clean = deduped.filter(item => CONTENT_CONTEXT_RE.test(item.name ?? ''));
 
-  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterJunk.length} junk → ${afterTcg.length} TCG → ${deduped.length} dedup → ${clean.length} card-keyword`);
+  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterCat.length} cat → ${afterJunk.length} junk → ${afterTcg.length} TCG → ${deduped.length} dedup → ${clean.length} context`);
 
   return clean;
 }
