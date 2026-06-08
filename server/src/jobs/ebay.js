@@ -530,7 +530,7 @@ const CARD_CATEGORY_IDS = '212,183454,259104,183456';
 // Title patterns that definitively indicate non-card merchandise.
 // Applied as a client-side safety net after eBay's category filter.
 const REJECT_TITLE_RE =
-  /\b(t-shirt|hoodie|sweatshirt|sneaker|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let))\b|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+photo/i;
+  /\b(t-shirt|hoodie|sweatshirt|sneakers?|shoes?|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let)|liftgate|chevy|gmc|truck)\b|air\s+jordan|jordan\s+\d+\s*(mid|low|high|og|retro)\b|size\s+\d|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+(photo|jersey|shirt|print)/i;
 
 // Whitelisted TCG game names.  Any result classified as 'tcg' must match
 // at least one of these or it is filtered out (blocks unknown or inappropriate
@@ -538,19 +538,25 @@ const REJECT_TITLE_RE =
 const TCG_GAME_RE =
   /\b(pokemon|pok[eé]mon|magic|m\.?t\.?g\.?|yu[-\s]?gi[-\s]?oh|yugioh|one\s+piece|dragon\s+ball|lorcana|flesh\s+and\s+blood|digimon|naruto|final\s+fantasy)\b/i;
 
+// Positive allowlist — at least one of these must appear in the title.
+// This is the main backstop against shoes, car parts, and other junk that
+// slips past the REJECT filter.  Every legitimate card listing will contain
+// at least one grading company, brand name, or card-specific term.
+const CARD_KEYWORD_RE =
+  /\b(card|psa|bgs|sgc|cgc|rookie|refractor|prizm|topps|panini|bowman|upper\s+deck|donruss|fleer|pokemon|pok[eé]mon|mtg|yu[-\s]?gi[-\s]?oh|yugioh)\b/i;
+
 async function ebaySearch(query, limit = 25) {
   const token = await getToken();
   const env   = (process.env.EBAY_ENV ?? 'production').toLowerCase();
   const base  = API_BASE[env] ?? API_BASE.production;
 
-  // Single-word queries are too generic — append "trading card" so eBay's
-  // relevance ranking focuses on card listings even within the category filter.
-  const words = query.trim().split(/\s+/);
-  const base_q = words.length < 2 ? `${query.trim()} trading card` : query.trim();
+  // Always append "trading card" so eBay's relevance engine ranks card
+  // listings first.  This is the primary fix for queries like "jordan 1"
+  // returning Air Jordan sneakers — categoryIds alone doesn't force cards.
+  const base_q = `${query.trim()} trading card`;
 
-  // Negative keywords suppress common non-card merchandise.
-  // eBay Browse API has limited boolean support but this still helps ranking.
-  const q = `${base_q} -shirt -shoes -clothing -apparel -jersey`;
+  // Negative keywords tell eBay's relevance engine to deprioritise junk.
+  const q = `${base_q} -shirt -shoes -sneaker -clothing -apparel -jersey -funko -poster`;
 
   // ── Build URL manually ────────────────────────────────────────────────────
   // URLSearchParams encodes commas as %2C.  eBay Browse API requires literal
@@ -619,14 +625,20 @@ async function ebaySearch(query, limit = 25) {
     return bHasImg - aHasImg;
   });
   const seen  = new Set();
-  const clean = sorted.filter(item => {
+  const deduped = sorted.filter(item => {
     const key = (item.name ?? '').toLowerCase().slice(0, 40);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 
-  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterJunk.length} after junk → ${afterTcg.length} after TCG filter → ${clean.length} after dedup`);
+  // ── Step 5: require at least one card-specific keyword ────────────────────
+  // Final backstop — any listing that doesn't mention a grading company,
+  // card brand, or card-specific term (e.g. "rookie", "prizm") is not a card.
+  // Shoes, car parts, and signed photos all fail this check.
+  const clean = deduped.filter(item => CARD_KEYWORD_RE.test(item.name ?? ''));
+
+  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterJunk.length} junk → ${afterTcg.length} TCG → ${deduped.length} dedup → ${clean.length} card-keyword`);
 
   return clean;
 }
