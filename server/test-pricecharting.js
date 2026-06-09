@@ -25,12 +25,13 @@ if (!(process.env.PRICE_CHARTING_TOKEN ?? '').trim()) {
 const TEST_CARDS = [
   // Sports cards — well-indexed on PriceCharting
   // card_number helps the #1 query variation ("LeBron James #111") hit product-name directly
-  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'raw'    },
-  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'graded' },
-  { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        card_number: '321', condition: 'graded' },
-  { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome',                     condition: 'raw'    },
+  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'raw' },
+  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'graded', grading_company: 'PSA', grade: '9'   },
+  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'graded', grading_company: 'BGS', grade: '9.5' },
+  { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        card_number: '321', condition: 'graded', grading_company: 'PSA', grade: '10'  },
+  { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome',                     condition: 'raw' },
   // Pokemon
-  { name: 'Charizard',     year: 1999, set_name: 'Base Set',                         condition: 'raw'    },
+  { name: 'Charizard',     year: 1999, set_name: 'Base Set',                         condition: 'raw' },
 ];
 
 async function run() {
@@ -40,15 +41,16 @@ async function run() {
   let failed = 0;
 
   for (const card of TEST_CARDS) {
-    const label = `${card.name} ${card.year ?? ''} ${card.set_name ?? ''} (${card.condition})`.trim();
+    const gradeTag = card.condition === 'graded' ? ` ${card.grading_company} ${card.grade}` : '';
+    const label = `${card.name} ${card.year ?? ''} ${card.set_name ?? ''} (${card.condition}${gradeTag})`.trim();
     try {
-      const price = await fetchPriceCharting(card);
-      if (price != null && price > 0) {
-        console.log(`  ✓  ${label}\n     → $${price.toFixed(2)}\n`);
+      const result = await fetchPriceCharting(card);
+      if (result != null && result.price > 0) {
+        console.log(`  ✓  ${label}\n     → $${result.price.toFixed(2)} from ${result.field}${result.image ? `\n     image: ${result.image}` : ''}\n`);
         passed++;
       } else {
-        console.log(`  –  ${label}\n     → null (no price on PriceCharting — eBay fallback will be used)\n`);
-        passed++; // null is valid — eBay fallback handles it
+        console.log(`  –  ${label}\n     → null (no price on PriceCharting)\n`);
+        passed++; // null is valid — item simply stays unpriced
       }
     } catch (err) {
       console.error(`  ✗  ${label}\n     → ERROR: ${err.message}\n`);

@@ -128,6 +128,9 @@ router.get('/:username', async (req, res) => {
          WHERE catalog_id = pi.catalog_id
            AND sold_median IS NOT NULL
            AND source <> 'ebay'
+           AND (source = 'mock'
+                OR (condition IS NOT DISTINCT FROM pi.condition
+                    AND grade IS NOT DISTINCT FROM pi.grade))
          ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
                   recorded_at DESC
          LIMIT 1

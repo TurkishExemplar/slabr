@@ -22,6 +22,11 @@ const ITEM_SELECT = `
 // PriceCharting; 'manual' covers 1/1 owner estimates and 'mock' is seeded
 // placeholder data.  eBay rows are excluded — eBay is an active-listing
 // source (active_low), never a market-value source.
+//
+// Real-source rows must match the item's (condition, grade) combo so a PSA 9
+// item is never valued from the raw or PSA 10 price.  Mock rows are exempt:
+// they are seeded as ('raw', NULL) placeholders meant to apply to any combo
+// until a real price lands.
 const PRICE_JOIN = `
   LEFT JOIN LATERAL (
     SELECT sold_median, source, recorded_at
@@ -29,6 +34,9 @@ const PRICE_JOIN = `
     WHERE catalog_id = pi.catalog_id
       AND sold_median IS NOT NULL
       AND source <> 'ebay'
+      AND (source = 'mock'
+           OR (condition IS NOT DISTINCT FROM pi.condition
+               AND grade IS NOT DISTINCT FROM pi.grade))
     ORDER BY
       CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
       recorded_at DESC
@@ -60,7 +68,9 @@ router.get('/history', async (req, res) => {
     // One row per (portfolio item, day): when a day has rows from multiple
     // sources (e.g. a seeded mock row plus a real pricecharting row), only the
     // highest-ranked source counts — pricecharting > manual > ebay > mock —
-    // so the daily total never double-counts an item.
+    // so the daily total never double-counts an item.  Real-source rows must
+    // match the item's (condition, grade) combo; mock placeholder rows
+    // ('raw', NULL) are exempt so unpriced items still chart something.
     const { rows } = await pool.query(`
       SELECT date, ROUND(SUM(value * quantity)::numeric, 2) AS total_value
       FROM (
@@ -74,6 +84,9 @@ router.get('/history', async (req, res) => {
         JOIN portfolio_items pi
           ON ph.catalog_id = pi.catalog_id AND pi.user_id = $1
         WHERE COALESCE(ph.sold_median, ph.active_low) IS NOT NULL
+          AND (ph.source = 'mock'
+               OR (ph.condition IS NOT DISTINCT FROM pi.condition
+                   AND ph.grade IS NOT DISTINCT FROM pi.grade))
         ORDER BY
           pi.id,
           date_trunc('day', ph.recorded_at),
@@ -114,10 +127,12 @@ router.post('/', async (req, res) => {
         WHERE catalog_id = $1
           AND sold_median IS NOT NULL
           AND source <> 'ebay'
+          AND (source = 'mock'
+               OR (condition IS NOT DISTINCT FROM $2 AND grade IS NOT DISTINCT FROM $3))
         ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
                  recorded_at DESC
         LIMIT 1
-      `, [catalog_id]);
+      `, [catalog_id, condition ?? null, grade ?? null]);
       current_value = priceRes.rows[0]?.sold_median ?? null;
     }
 
@@ -181,27 +196,30 @@ router.get('/:id', async (req, res) => {
 
     const item = rows[0];
 
-    // One point per day for the chart: when a day has rows from multiple
-    // sources, plot only the highest-ranked one (pricecharting > manual >
-    // ebay > mock) so the line never zig-zags between market value and
-    // active-listing floor.
+    // Chart = market value over time, using the exact row-selection semantics
+    // of PRICE_JOIN (sold_median only, no ebay rows, combo-matched with the
+    // mock exemption) so the line's last point always equals the Market Value
+    // shown on the page.  One point per day: highest-ranked source wins
+    // (pricecharting > manual > mock).
     const { rows: historyRows } = await pool.query(`
       SELECT date, value, source FROM (
         SELECT DISTINCT ON (date_trunc('day', recorded_at))
           date_trunc('day', recorded_at)::date::text AS date,
-          -- ebay rows carry active_low only; all other sources carry sold_median
-          ROUND(COALESCE(sold_median, active_low)::numeric, 2) AS value,
+          ROUND(sold_median::numeric, 2) AS value,
           source
         FROM price_history
         WHERE catalog_id = $1
-          AND COALESCE(sold_median, active_low) IS NOT NULL
+          AND sold_median IS NOT NULL
+          AND source <> 'ebay'
+          AND (source = 'mock'
+               OR (condition IS NOT DISTINCT FROM $2 AND grade IS NOT DISTINCT FROM $3))
         ORDER BY
           date_trunc('day', recorded_at),
-          CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 WHEN 'ebay' THEN 3 ELSE 4 END,
+          CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
           recorded_at DESC
       ) best
       ORDER BY date ASC
-    `, [item.catalog_id]);
+    `, [item.catalog_id, item.condition, item.grade]);
 
     // For 1/1 items, include comparable sales
     let comparableSales = [];

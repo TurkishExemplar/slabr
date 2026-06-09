@@ -157,81 +157,6 @@ function pickBestImage(items, name) {
   return (best ?? items[0])?.image?.imageUrl ?? null;
 }
 
-// Sealed/non-card keywords that disqualify a listing as a card image source.
-const JUNK_IMAGE_RE = /\b(pack|box|lot|case|sealed|set|bundle|wrapper|wax|blaster|hobby)\b/i;
-
-// Parallel/variation keywords that identify non-base parallels in eBay titles.
-// Used to reject listing images that show the wrong version of a card —
-// e.g. an X-Fractor or Refractor image for a catalog entry that is the base
-// Topps Chrome version.  If the catalog item's own name or set_name already
-// contains one of these terms it means the item IS that parallel, so we allow it.
-const PARALLEL_IMAGE_RE = /\b(refractor|x[-\s]?fractor|prizm|optic|mosaic|superfractor|parallel|ssp|short\s*print)\b/i;
-
-// Dedicated image search — completely separate from the price search so we can
-// use a clean, non-graded query and apply strict per-result validation.
-//
-// Selection rules (all must pass):
-//   1. Title must NOT contain junk keywords (pack, box, lot, case, sealed, set…)
-//   2. Title must contain every significant word of the card/player name
-//   3. Image URL must end in .jpg / .jpeg / .png (not a placeholder or webp)
-//   4. If this catalog item is a base card (no parallel keyword in name/set_name),
-//      reject listings that contain parallel/variation keywords (Refractor,
-//      X-Fractor, Prizm, etc.) so we never show the wrong version of the card.
-// Returns null if no result passes all three checks — better to show nothing
-// than to save an image of a plastic pack.
-async function fetchCardImage(item) {
-  const { name, year, set_name, card_number } = item;
-  // Appending "card" nudges eBay's ranking toward individual card listings.
-  const q = [name, year, set_name, card_number, 'card'].filter(Boolean).join(' ');
-
-  // Name parts used for title matching (skip short words like "Jr", "de")
-  const nameParts = (name ?? '').toLowerCase().split(/\s+/).filter(p => p.length > 2);
-
-  // Determine whether this catalog item is itself a parallel/variation.
-  // If not, rule 4 will reject eBay listings that are parallels so we don't
-  // accidentally display an X-Fractor image for a base Chrome card.
-  const itemIdentity   = `${name ?? ''} ${set_name ?? ''}`;
-  const itemIsParallel = PARALLEL_IMAGE_RE.test(itemIdentity);
-
-  try {
-    const data = await ebayGet('/buy/browse/v1/item_summary/search', {
-      q,
-      limit:  15,
-      sort:   'newlyListed',
-      filter: 'buyingOptions:{FIXED_PRICE}',
-    });
-
-    for (const listing of data.itemSummaries ?? []) {
-      const title  = (listing.title ?? '').toLowerCase();
-      const imgUrl = listing.image?.imageUrl ?? '';
-
-      // Rule 1: no sealed product / lot / set in the title
-      if (JUNK_IMAGE_RE.test(title)) continue;
-
-      // Rule 2: title must contain the player/card name
-      if (nameParts.length > 0 && !nameParts.every(p => title.includes(p))) continue;
-
-      // Rule 3: real image file (not a CDN placeholder or webp thumbnail)
-      if (!/\.(jpg|jpeg|png)(\?.*)?$/i.test(imgUrl)) continue;
-
-      // Rule 4: reject parallel listings for base-card queries.
-      // Prevents a "2003 Topps Chrome X-Fractor" image being used for the
-      // base "2003 Topps Chrome" entry.  Skipped when the item itself is a
-      // parallel (so "Topps Chrome Refractor" correctly gets a Refractor image).
-      if (!itemIsParallel && PARALLEL_IMAGE_RE.test(title)) continue;
-
-      console.log(`[ebay] fetchCardImage selected: "${listing.title}"`);
-      return imgUrl;
-    }
-
-    console.log(`[ebay] fetchCardImage: no clean image found for "${q}" — leaving image_url unchanged`);
-    return null;
-  } catch (err) {
-    console.error(`[ebay] fetchCardImage failed: ${err.message}`);
-    return null;
-  }
-}
-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── eBay fetch helpers ────────────────────────────────────────────────────────
@@ -274,9 +199,9 @@ async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
   };
 }
 
-// Junk filter for display listings — lighter than JUNK_IMAGE_RE because card
-// titles legitimately contain words like "set" ("Base Set") and "box" is fine
-// for sealed items.  Blocks multi-card lots and fakes only.
+// Junk filter for display listings — intentionally light: card titles
+// legitimately contain words like "set" ("Base Set") and "box" is fine for
+// sealed items.  Blocks multi-card lots and fakes only.
 const LISTING_JUNK_RE = /\b(lot|bundle|reseal|resealed|proxy|digital|custom|reprint)\b/i;
 
 // ── Active eBay listings for the item detail page ─────────────────────────────
@@ -410,9 +335,20 @@ async function _runEbayJobInner(hasEbay) {
       // Market value (skip for 1/1) — PriceCharting only; eBay is an
       // active-listing source, not a sold-price source.
       if (!isOneOfOne) {
-        soldMedian = await fetchPriceCharting(combo);
-        if (soldMedian != null) {
-          console.log(`[ebay-job] ${combo.name} | PriceCharting market value: $${soldMedian}`);
+        const pc = await fetchPriceCharting(combo);
+        if (pc != null) {
+          soldMedian = pc.price;
+          console.log(`[ebay-job] ${combo.name} | PriceCharting market value: $${soldMedian} (${pc.field})`);
+
+          // Card image from the PriceCharting product — never overwrite a
+          // user-uploaded photo (data: URI).
+          if (pc.image) {
+            await pool.query(
+              `UPDATE master_catalog SET image_url = $1
+               WHERE id = $2 AND (image_url IS NULL OR image_url NOT LIKE 'data:%')`,
+              [pc.image, combo.catalog_id]
+            );
+          }
         }
       } else {
         skippedOneOfOne++;
@@ -720,9 +656,7 @@ async function ebaySearch(query, limit = 25) {
 // Prices are in CENTS — divide by 100 for dollars.
 // PriceCharting stores 0 for "no price recorded"; treat as missing.
 //
-// Price-field selection:
-//   graded items    → graded-price
-//   raw / ungraded  → loose-price
+// Price-field selection is grade-aware — see pcPriceFields().
 //
 // Query variations (most → least specific):
 //   Try 1: "name #card_number"           → "LeBron James #111"
@@ -731,7 +665,9 @@ async function ebaySearch(query, limit = 25) {
 //   Try 4: "name year"                   → "LeBron James 2003"
 //   Try 5: "name"                        → "LeBron James"
 //
-// Returns a price in dollars (number) or null when no usable price was found.
+// Returns { price, image, field, productName, consoleName } or null when no
+// usable price was found.  `image` is the card image from the PriceCharting
+// product (or its images CDN), null when unavailable.
 
 const PC_BASES = [
   'https://www.sportscardspro.com',  // primary — real sports cards
@@ -757,6 +693,54 @@ function scorePcProduct(product, year, set_name) {
   return score;
 }
 
+// ── Grade → PriceCharting price-field mapping ────────────────────────────────
+// SportsCardsPro grade-specific price fields:
+//   loose-price        = raw / ungraded
+//   cib-price          = PSA 8 / BGS 9 equivalent
+//   graded-price       = PSA 9 / BGS 9.5 equivalent
+//   condition-17-price = PSA 10 gem mint
+//   condition-18-price = BGS 10 Black Label
+//
+// PSA grades run roughly half a grade below BGS/SGC equivalents, so the
+// graded-price cutoff is 9 for PSA but 9.5 for BGS/SGC half-grade scales.
+// Returns an ordered field chain — the first field with a value > 0 wins.
+function pcPriceFields(item) {
+  const { condition, grading_company, grade } = item;
+  if (condition !== 'graded') return ['loose-price'];
+
+  const g = parseFloat(grade);
+  if (isNaN(g)) return ['graded-price', 'cib-price']; // graded, but grade unknown
+
+  const co = (grading_company ?? 'PSA').toUpperCase();
+  if (g >= 10) return ['condition-17-price', 'graded-price'];   // PSA/BGS/SGC 10
+  const gradedCutoff = co === 'PSA' ? 9 : 9.5;                  // PSA 9 ≈ BGS 9.5
+  if (g >= gradedCutoff) return ['graded-price'];
+  if (g >= 8) return ['cib-price'];                             // PSA 8 ≈ BGS 9
+  return ['loose-price'];                                       // low-grade slabs ≈ raw floor
+}
+
+// Image-field candidates seen across PriceCharting/SportsCardsPro product
+// responses — the API does not document an image field, so probe broadly.
+const PC_IMAGE_FIELDS = ['image', 'image-url', 'image_url', 'photo', 'photo-url', 'cover-url', 'boxart-url'];
+
+// Extract a card image from a PriceCharting product response.  Falls back to
+// the predictable images CDN path, validated with a HEAD request so a wrong
+// guess can never save a broken URL.  Returns null when no image exists —
+// callers keep the item's current image in that case.
+async function pcProductImage(product) {
+  for (const f of PC_IMAGE_FIELDS) {
+    const v = product[f];
+    if (typeof v === 'string' && /^https?:\/\//.test(v)) return v;
+  }
+  if (!product.id) return null;
+  const cdnUrl = `https://commondatastorage.googleapis.com/images.pricecharting.com/${product.id}/1600.jpg`;
+  try {
+    const head = await fetch(cdnUrl, { method: 'HEAD', signal: AbortSignal.timeout(6_000) });
+    if (head.ok && (head.headers.get('content-type') ?? '').startsWith('image/')) return cdnUrl;
+  } catch (_) { /* no CDN image */ }
+  return null;
+}
+
 // Build the deduplicated query-variation ladder for an item (most → least specific).
 function buildPcQueries(item) {
   const { name, year, set_name, card_number } = item;
@@ -775,7 +759,7 @@ function buildPcQueries(item) {
 }
 
 // Run the full query-variation ladder against one domain.
-// Returns a price in dollars or null.
+// Returns { price, image, field, productName, consoleName } or null.
 async function pcLookupOnBase(baseUrl, item, token) {
   const { year, set_name, condition } = item;
   const tEnc    = encodeURIComponent(token);
@@ -831,20 +815,30 @@ async function pcLookupOnBase(baseUrl, item, token) {
         }
       }
 
-      // Strict field mapping: graded → graded-price, raw → loose-price.
+      // Grade-aware field chain — first field with a positive value wins.
       // Values are cents; 0 means "no price recorded".
-      const cents = condition === 'graded'
-        ? (product['graded-price'] > 0 ? product['graded-price'] : null)
-        : (product['loose-price']  > 0 ? product['loose-price']  : null);
+      const fields = pcPriceFields(item);
+      let cents = null;
+      let field = null;
+      for (const f of fields) {
+        if (product[f] > 0) { cents = product[f]; field = f; break; }
+      }
 
       if (cents == null) {
-        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? '?'}) has no ${condition === 'graded' ? 'graded' : 'loose'}-price — skipping`);
+        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? '?'}) has no ${fields.join(' / ')} value — skipping`);
         continue;
       }
 
       const price = parseFloat((cents / 100).toFixed(2));
-      console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" | ${product['console-name'] ?? best['console-name'] ?? '?'} — $${price} via "${q}"`);
-      return price;
+      const image = await pcProductImage(product);
+      console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" | ${product['console-name'] ?? best['console-name'] ?? '?'} — $${price} from ${field}${image ? ' (+image)' : ''} via "${q}"`);
+      return {
+        price,
+        image,
+        field,
+        productName: product['product-name'],
+        consoleName: product['console-name'] ?? best['console-name'] ?? null,
+      };
 
     } catch (err) {
       console.error(`[pricecharting] ${tryTag} error for "${q}": ${err.message}`);
@@ -861,8 +855,8 @@ async function fetchPriceCharting(item) {
 
   // sportscardspro.com first; pricecharting.com only when it yields nothing.
   for (const baseUrl of PC_BASES) {
-    const price = await pcLookupOnBase(baseUrl, item, token);
-    if (price != null) return price;
+    const result = await pcLookupOnBase(baseUrl, item, token);
+    if (result != null) return result;
   }
 
   console.log('[pricecharting] all domains and query variations exhausted — no usable price');
@@ -919,30 +913,28 @@ async function priceSingleItem(catalogId, condition, grade) {
   if (!isOneOfOne) {
     // Market value (sold median) comes from PriceCharting only — eBay is an
     // active-listing source, not a sold-price source.
-    soldMedian = await fetchPriceCharting(catalogRow);
-    if (soldMedian != null) {
-      console.log(`[pricing] PriceCharting market value: $${soldMedian}`);
+    const pc = await fetchPriceCharting(catalogRow);
+    if (pc != null) {
+      soldMedian = pc.price;
+      console.log(`[pricing] PriceCharting market value: $${soldMedian} (${pc.field})`);
+
+      // Card image comes from the PriceCharting product.  Never overwrite a
+      // user-uploaded photo (data: URI from a scan or manual upload).
+      if (pc.image) {
+        await pool.query(
+          `UPDATE master_catalog SET image_url = $1
+           WHERE id = $2 AND (image_url IS NULL OR image_url NOT LIKE 'data:%')`,
+          [pc.image, catalogId]
+        );
+        console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}`);
+      }
     }
   }
 
-  // Active listings and card image are always sourced from eBay (when configured).
+  // Active-listing floor is always sourced from eBay (when configured).
   if (hasEbay) {
     const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
     activeLow = activeResult.activeLow;
-
-    // Fetch a card image from eBay and store it — but ONLY if the catalog entry
-    // has no image yet.  This preserves user-uploaded scan photos: when someone
-    // scans their physical card the photo they took is saved as a data: URL and
-    // should remain the displayed image.  eBay images are a fallback for items
-    // that have no photo at all (manually added or scan photo was too large to save).
-    const imageUrl = await fetchCardImage(catalogRow);
-    if (imageUrl) {
-      await pool.query(
-        'UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL',
-        [imageUrl, catalogId]
-      );
-      console.log(`[pricing] catalog image set from eBay for catalog_id=${catalogId}`);
-    }
   }
 
   if (soldMedian != null || activeLow != null) {
@@ -988,6 +980,7 @@ async function priceSingleItem(catalogId, condition, grade) {
 }
 
 module.exports = {
-  runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchActiveListings,
-  buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
+  runEbayJob, ebaySearch, priceSingleItem, fetchActiveListings,
+  buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceFields,
+  PC_BASES, PC_JUNK_CONSOLE_RE,
 };

@@ -66,17 +66,10 @@ export default function Item() {
   const [saving, setSaving]                 = useState(false);
   const [deleteConfirm, setDeleteConfirm]   = useState(false);
 
-  // Refresh Image
-  const [refreshingImg, setRefreshingImg]   = useState(false);
-  const [imgRefreshMsg, setImgRefreshMsg]   = useState(null);
-
   // 1/1 manual value editing
   const [editingManualValue, setEditingManualValue] = useState(false);
   const [manualValueInput, setManualValueInput]     = useState('');
   const [savingManualValue, setSavingManualValue]   = useState(false);
-
-  // Custom image upload
-  const [uploadingImg, setUploadingImg]             = useState(false);
 
   // Live eBay listings — fetched lazily after the main item data so the
   // page renders fast even when eBay is slow.
@@ -91,7 +84,6 @@ export default function Item() {
   const [nameToast, setNameToast]                   = useState(null);
 
   // DOM refs
-  const fileInputRef  = useRef(null);
   const nameInputRef  = useRef(null);
 
   useEffect(() => {
@@ -154,85 +146,6 @@ export default function Item() {
     // Drop rows where value is null (sold_median and active_low both missing)
     return filtered.filter(r => r.value != null && parseFloat(r.value) > 0);
   }, [priceHistory, range]);
-
-  async function handleRefreshImage() {
-    setRefreshingImg(true);
-    setImgRefreshMsg(null);
-    try {
-      const res  = await fetch(`${API}/api/admin/refresh-image/${item.catalog_id}`, {
-        method:  'POST',
-        headers: {
-          Authorization:     `Bearer ${token}`,
-          'X-Admin-Secret':  import.meta.env.VITE_ADMIN_SECRET ?? '',
-        },
-      });
-      const data = await res.json();
-      if (data.ok && data.image_url) {
-        setItem(prev => ({ ...prev, image_url: data.image_url }));
-        setImgRefreshMsg('Image updated ✓');
-      } else {
-        setImgRefreshMsg(data.message ?? data.error ?? 'No clean image found');
-      }
-    } catch (e) {
-      setImgRefreshMsg('Request failed');
-    } finally {
-      setRefreshingImg(false);
-      setTimeout(() => setImgRefreshMsg(null), 4000);
-    }
-  }
-
-  function handleImageUpload(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const ALLOWED = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
-    if (!ALLOWED.includes(file.type)) {
-      setImgRefreshMsg('Only JPEG, PNG, and WebP images are accepted');
-      setTimeout(() => setImgRefreshMsg(null), 4000);
-      e.target.value = '';
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setImgRefreshMsg('Image too large — maximum 5MB');
-      setTimeout(() => setImgRefreshMsg(null), 4000);
-      e.target.value = '';
-      return;
-    }
-
-    setUploadingImg(true);
-    setImgRefreshMsg(null);
-
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const res = await fetch(`${API}/api/portfolio/${id}/image`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ image_base64: event.target.result }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          setItem(prev => ({ ...prev, image_url: data.image_url }));
-          setImgRefreshMsg('Image updated ✓');
-        } else {
-          setImgRefreshMsg(data.error ?? 'Image update failed — please try again');
-        }
-      } catch {
-        setImgRefreshMsg('Image update failed — please try again');
-      } finally {
-        setUploadingImg(false);
-        setTimeout(() => setImgRefreshMsg(null), 4000);
-        e.target.value = '';
-      }
-    };
-    reader.onerror = () => {
-      setImgRefreshMsg('Image update failed — please try again');
-      setUploadingImg(false);
-      setTimeout(() => setImgRefreshMsg(null), 4000);
-      e.target.value = '';
-    };
-    reader.readAsDataURL(file);
-  }
 
   async function handleSave() {
     setSaving(true);
@@ -438,35 +351,6 @@ export default function Item() {
               }
             </div>
 
-            {/* Image controls */}
-            <div className="flex flex-col items-center gap-1">
-              <div className="flex gap-2 w-full">
-                <button
-                  onClick={handleRefreshImage}
-                  disabled={refreshingImg || uploadingImg}
-                  className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {refreshingImg ? 'Refreshing…' : '↻ Refresh Image'}
-                </button>
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploadingImg || refreshingImg}
-                  className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {uploadingImg ? 'Uploading…' : '↑ Update Image'}
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/jpg,image/png,image/webp"
-                  className="hidden"
-                  onChange={handleImageUpload}
-                />
-              </div>
-              {imgRefreshMsg && (
-                <p className="text-xs text-zinc-500">{imgRefreshMsg}</p>
-              )}
-            </div>
 
             {/* Identity */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
@@ -645,14 +529,32 @@ export default function Item() {
                     <YAxis
                       tick={{ fill: '#71717a', fontSize: 10 }}
                       width={56}
-                      tickFormatter={v => v >= 1000 ? `$${(v/1000).toFixed(0)}K` : `$${v}`}
+                      // Fit the axis to the data range — a $1,400–$1,500 card
+                      // shouldn't be plotted on a $0-based axis as a flat line.
+                      domain={['auto', 'auto']}
+                      // One decimal under $10K so a tight domain doesn't render
+                      // duplicate "$7K $7K $8K" ticks
+                      tickFormatter={v => v >= 10000 ? `$${(v/1000).toFixed(0)}K` : v >= 1000 ? `$${(v/1000).toFixed(1)}K` : `$${v}`}
                     />
                     <Tooltip
                       contentStyle={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 8 }}
                       labelStyle={{ color: '#a1a1aa', fontSize: 11 }}
                       formatter={v => [fmt$(parseFloat(v)), 'Value']}
                     />
-                    <Line type="monotone" dataKey="value" stroke={isOneOfOne ? '#f59e0b' : '#6366f1'} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    {/* A single data point can't draw a line — show a labeled dot instead */}
+                    <Line
+                      type="monotone"
+                      dataKey="value"
+                      stroke={isOneOfOne ? '#f59e0b' : '#6366f1'}
+                      strokeWidth={2}
+                      dot={chartData.length === 1
+                        ? { r: 5, fill: isOneOfOne ? '#f59e0b' : '#6366f1', strokeWidth: 0 }
+                        : false}
+                      label={chartData.length === 1
+                        ? { position: 'top', fill: '#a1a1aa', fontSize: 11, formatter: v => fmt$(parseFloat(v)) }
+                        : undefined}
+                      activeDot={{ r: 4 }}
+                    />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (

@@ -1,8 +1,8 @@
 const express = require('express');
 const pool    = require('../db');
 const {
-  runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting,
-  scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
+  runEbayJob, priceSingleItem, fetchPriceCharting,
+  scorePcProduct, buildPcQueries, pcPriceFields, PC_BASES, PC_JUNK_CONSOLE_RE,
 } = require('../jobs/ebay');
 
 const router = express.Router();
@@ -57,44 +57,10 @@ router.post('/ebay-job/:catalog_id', async (req, res) => {
   }
 });
 
-// ── Manual image refresh ──────────────────────────────────────────────────────
-// POST /api/admin/refresh-image/:catalog_id
-// Runs fetchCardImage for a specific catalog entry and unconditionally updates
-// master_catalog.image_url.  Useful when an old wrong image is already saved
-// and priceSingleItem's auto-refresh hasn't run yet.
-
-router.post('/refresh-image/:catalog_id', async (req, res) => {
-  const catalogId = parseInt(req.params.catalog_id);
-  if (isNaN(catalogId)) {
-    return res.status(400).json({ error: 'Invalid catalog_id' });
-  }
-
-  try {
-    const { rows } = await pool.query(
-      'SELECT id, name, year, set_name, card_number FROM master_catalog WHERE id = $1',
-      [catalogId]
-    );
-    if (!rows.length) {
-      return res.status(404).json({ error: 'Catalog entry not found' });
-    }
-
-    const imageUrl = await fetchCardImage(rows[0]);
-    if (!imageUrl) {
-      return res.json({ ok: false, message: 'No clean image found — image_url unchanged' });
-    }
-
-    await pool.query('UPDATE master_catalog SET image_url = $1 WHERE id = $2', [imageUrl, catalogId]);
-    console.log(`[admin] refresh-image: catalog_id=${catalogId} → ${imageUrl}`);
-    res.json({ ok: true, catalog_id: catalogId, image_url: imageUrl });
-  } catch (err) {
-    console.error('[admin refresh-image]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── PriceCharting connectivity / endpoint probe ───────────────────────────────
 // GET /api/admin/test-pricecharting
-//   ?name=LeBron+James&year=2003&set_name=Topps+Chrome&card_number=111&condition=raw
+//   ?name=LeBron+James&year=2003&set_name=Topps+Chrome&card_number=111
+//   &condition=graded&grading_company=BGS&grade=9.5
 //
 // Phase 1 — endpoint probe: hits every base-URL × endpoint combo with "LeBron James"
 //   and returns the raw HTTP status + first 600 chars of every response body so
@@ -130,11 +96,16 @@ router.get('/test-pricecharting', async (req, res) => {
     return res.status(503).json({ error: 'PRICE_CHARTING_TOKEN is not set in the environment' });
   }
 
-  const name        = (req.query.name        ?? 'LeBron James').trim();
-  const year        = req.query.year         ? parseInt(req.query.year, 10) : null;
-  const set_name    = (req.query.set_name    ?? '').trim() || null;
-  const card_number = (req.query.card_number ?? '').trim() || null;
-  const condition   = req.query.condition === 'graded' ? 'graded' : 'raw';
+  const name            = (req.query.name        ?? 'LeBron James').trim();
+  const year            = req.query.year         ? parseInt(req.query.year, 10) : null;
+  const set_name        = (req.query.set_name    ?? '').trim() || null;
+  const card_number     = (req.query.card_number ?? '').trim() || null;
+  const condition       = req.query.condition === 'graded' ? 'graded' : 'raw';
+  const grading_company = (req.query.grading_company ?? '').trim() || null;
+  const grade           = (req.query.grade           ?? '').trim() || null;
+
+  // Grade-aware price-field chain (mirrors fetchPriceCharting exactly)
+  const priceFields = pcPriceFields({ condition, grading_company, grade });
 
   // Token info for debugging (never expose the full token)
   const tokenInfo = {
@@ -249,10 +220,17 @@ router.get('/test-pricecharting', async (req, res) => {
 
         const product = (priceData && priceData.status === 'success') ? priceData : best;
 
-        // Strict mapping: graded → graded-price, raw → loose-price (cents)
-        const cents = condition === 'graded'
-          ? (product['graded-price'] > 0 ? product['graded-price'] : null)
-          : (product['loose-price']  > 0 ? product['loose-price']  : null);
+        // Grade-aware field chain — first field with a positive value wins
+        let cents = null;
+        let selectedField = null;
+        for (const f of priceFields) {
+          if (product[f] > 0) { cents = product[f]; selectedField = f; break; }
+        }
+
+        // Image-field probe (mirrors pcProductImage candidates, minus the CDN
+        // HEAD check) so production responses reveal what the API exposes.
+        const imageField = ['image', 'image-url', 'image_url', 'photo', 'photo-url', 'cover-url', 'boxart-url']
+          .find(f => typeof product[f] === 'string' && /^https?:\/\//.test(product[f])) ?? null;
 
         const entry = {
           base:             host,
@@ -265,10 +243,17 @@ router.get('/test-pricecharting', async (req, res) => {
           product_name:     product['product-name']  ?? best['product-name'],
           console_name:     product['console-name']  ?? best['console-name'] ?? null,
           console_score:    scored[0].score,
-          loose_price:      (product['loose-price']  ?? 0) / 100,
-          cib_price:        (product['cib-price']    ?? 0) / 100,
-          graded_price:     (product['graded-price'] ?? 0) / 100,
+          price_field_chain: priceFields,
+          selected_field:   selectedField,
+          loose_price:        (product['loose-price']        ?? 0) / 100,
+          cib_price:          (product['cib-price']          ?? 0) / 100,
+          graded_price:       (product['graded-price']       ?? 0) / 100,
+          condition_17_price: (product['condition-17-price'] ?? 0) / 100,
+          condition_18_price: (product['condition-18-price'] ?? 0) / 100,
           selected_dollars: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
+          image_field:      imageField,
+          image:            imageField ? product[imageField] : null,
+          product_keys:     Object.keys(product),
           total_search_results: searchData.products.length,
           funko_filtered:   searchData.products.length - candidates.length,
           top_candidates: scored.slice(0, 3).map(({ p, score }) => ({
