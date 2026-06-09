@@ -97,9 +97,11 @@ export default function Item() {
     const now    = Date.now();
     const cutoff = range === '30d' ? now - 30 * 86400_000 :
                    range === '90d' ? now - 90 * 86400_000 : null;
-    return cutoff
+    const filtered = cutoff
       ? priceHistory.filter(r => new Date(r.date).getTime() >= cutoff)
       : priceHistory;
+    // Drop rows where value is null (sold_median and active_low both missing)
+    return filtered.filter(r => r.value != null && parseFloat(r.value) > 0);
   }, [priceHistory, range]);
 
   async function handleRefreshImage() {
@@ -220,10 +222,14 @@ export default function Item() {
     const v = parseFloat(raw);
     return !isNaN(v) && v > 0 ? v : null;
   })();
-  const cost       = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
+  // Treat purchase_price of 0 as unknown — gain/loss can't be computed without a real cost basis.
+  const cost       = item.purchase_price != null && parseFloat(item.purchase_price) > 0
+    ? parseFloat(item.purchase_price) : null;
   const totalValue = displayValue != null ? displayValue * item.quantity : null;
   const totalCost  = cost != null ? cost * item.quantity : null;
-  const gain       = totalValue != null && totalCost != null ? totalValue - totalCost : null;
+  // Only compute gain/loss when BOTH current value AND purchase price are real non-zero numbers.
+  const gain       = totalValue != null && totalCost != null && totalCost > 0
+    ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
   // 'none' = no price history at all (new scan, not yet priced or no eBay results)
   // 'mock' = has a seeded mock price_history row
@@ -432,7 +438,7 @@ export default function Item() {
                   ))}
                 </div>
               </div>
-              {chartData.length > 1 ? (
+              {chartData.length >= 1 ? (
                 <ResponsiveContainer width="100%" height={180}>
                   <LineChart data={chartData} margin={{ top: 2, right: 4, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />

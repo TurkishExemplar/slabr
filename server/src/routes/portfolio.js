@@ -53,10 +53,14 @@ router.get('/history', async (req, res) => {
     const { rows } = await pool.query(`
       SELECT
         date_trunc('day', ph.recorded_at)::date::text AS date,
-        ROUND(SUM(ph.sold_median * pi.quantity)::numeric, 2) AS total_value
+        -- Use active_low as fallback when sold_median is null (e.g. Marketplace
+        -- Insights scope not approved — priceSingleItem still inserts a row but
+        -- only active_low is populated).
+        ROUND(SUM(COALESCE(ph.sold_median, ph.active_low) * pi.quantity)::numeric, 2) AS total_value
       FROM price_history ph
       JOIN portfolio_items pi
         ON ph.catalog_id = pi.catalog_id AND pi.user_id = $1
+      WHERE COALESCE(ph.sold_median, ph.active_low) IS NOT NULL
       GROUP BY 1
       ORDER BY 1
     `, [req.user.userId]);
@@ -157,10 +161,12 @@ router.get('/:id', async (req, res) => {
     const { rows: historyRows } = await pool.query(`
       SELECT
         date_trunc('day', recorded_at)::date::text AS date,
-        ROUND(sold_median::numeric, 2) AS value,
+        -- Fall back to active_low when sold_median is null (Browse API fallback path)
+        ROUND(COALESCE(sold_median, active_low)::numeric, 2) AS value,
         source
       FROM price_history
       WHERE catalog_id = $1
+        AND COALESCE(sold_median, active_low) IS NOT NULL
       ORDER BY recorded_at ASC
     `, [item.catalog_id]);
 

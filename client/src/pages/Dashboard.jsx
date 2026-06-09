@@ -184,13 +184,36 @@ export default function Dashboard() {
   }
 
   const stats = useMemo(() => {
-    const totalValue = items.reduce((s, i) => s + effectiveValue(i) * i.quantity, 0);
-    const hasCost = items.some(i => i.purchase_price != null);
-    const totalCost = hasCost
-      ? items.reduce((s, i) => s + (i.purchase_price != null ? parseFloat(i.purchase_price) * i.quantity : 0), 0)
+    // Total portfolio value — unpriced items contribute 0, not null
+    const totalValue = items.reduce((s, i) => {
+      const v = effectiveValue(i);
+      return s + (v != null ? v * i.quantity : 0);
+    }, 0);
+
+    // Cost basis stat — all items that have a real (> 0) purchase price,
+    // regardless of whether they've been priced yet.
+    const costItems = items.filter(i => {
+      const p = i.purchase_price != null ? parseFloat(i.purchase_price) : null;
+      return p != null && p > 0;
+    });
+    const totalCost = costItems.length > 0
+      ? costItems.reduce((s, i) => s + parseFloat(i.purchase_price) * i.quantity, 0)
       : null;
-    const pl = totalCost != null ? totalValue - totalCost : null;
-    const plPct = pl != null && totalCost > 0 ? (pl / totalCost) * 100 : null;
+
+    // Gain / Loss — only items where BOTH current value AND purchase price are
+    // real non-zero numbers.  Unpriced cards are completely excluded so they
+    // cannot drag the total P&L negative.
+    const glItems = items.filter(i => {
+      const v = effectiveValue(i);
+      const p = i.purchase_price != null ? parseFloat(i.purchase_price) : null;
+      return v != null && v > 0 && p != null && p > 0;
+    });
+    const pl = glItems.length > 0
+      ? glItems.reduce((s, i) => s + (effectiveValue(i) - parseFloat(i.purchase_price)) * i.quantity, 0)
+      : null;
+    const glCost = glItems.reduce((s, i) => s + parseFloat(i.purchase_price) * i.quantity, 0);
+    const plPct = pl != null && glCost > 0 ? (pl / glCost) * 100 : null;
+
     return { totalValue, totalCost, pl, plPct };
   }, [items]);
 
@@ -387,9 +410,9 @@ export default function Dashboard() {
               <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider mb-5">
                 Portfolio Value
               </p>
-              {history.length > 1 ? (
+              {history.filter(h => h.total_value != null && parseFloat(h.total_value) > 0).length >= 1 ? (
                 <ResponsiveContainer width="100%" height={180}>
-                  <LineChart data={history} margin={{ top: 2, right: 4, bottom: 0, left: 0 }}>
+                  <LineChart data={history.filter(h => h.total_value != null && parseFloat(h.total_value) > 0)} margin={{ top: 2, right: 4, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
                     <XAxis
                       dataKey="date"
@@ -582,12 +605,14 @@ function StatCard({ label, value, sub, positive }) {
 function ItemCard({ item }) {
   const [imgLoaded, setImgLoaded] = useState(false);
   const value      = effectiveValue(item);                              // null when no real price
-  const cost       = item.purchase_price != null ? parseFloat(item.purchase_price) : null;
+  // Treat purchase_price of 0 as unknown — gain/loss can't be computed without a real cost basis.
+  const cost       = item.purchase_price != null && parseFloat(item.purchase_price) > 0
+    ? parseFloat(item.purchase_price) : null;
   const totalValue = value != null ? value * item.quantity : null;      // null → shows "—"
   const totalCost  = cost  != null ? cost  * item.quantity : null;
-  // Only calculate gain when we have a real current value — avoids showing a
-  // misleading negative number when the card hasn't been priced yet.
-  const gain       = totalValue != null && totalCost != null ? totalValue - totalCost : null;
+  // Only show gain/loss when BOTH current value AND purchase price are real non-zero numbers.
+  const gain       = totalValue != null && totalCost != null && totalCost > 0
+    ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
   const src        = item.is_one_of_one ? 'manual' : (item.price_source ?? 'none');
 

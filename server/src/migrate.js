@@ -113,16 +113,17 @@ END $$;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;
 
--- Clear bad image_url values so priceSingleItem / refresh-image can re-fetch.
--- Targets data: URIs (saved scan photos that were never replaced) and any CDN
--- URL that somehow contains junk keywords (pack, box, lot, etc.).
+-- Clear bad CDN image_url values so priceSingleItem / refresh-image can re-fetch.
+-- NOTE: data: URIs are intentionally preserved — they are scan photos uploaded
+-- by the user and should remain until eBay's priceSingleItem replaces them with
+-- a CDN URL.  Only clear eBay CDN URLs that contain junk keywords (pack, box, etc.)
 -- Safe to run repeatedly — only NULLs rows that still have bad values.
 UPDATE master_catalog
 SET image_url = NULL
 WHERE image_url IS NOT NULL
+  AND image_url NOT LIKE 'data:%'
   AND (
-    image_url LIKE 'data:%'
-    OR LOWER(image_url) LIKE '%pack%'
+    LOWER(image_url) LIKE '%pack%'
     OR LOWER(image_url) LIKE '%/lot/%'
     OR LOWER(image_url) LIKE '%sealed%'
     OR LOWER(image_url) LIKE '%wrapper%'
