@@ -1,6 +1,9 @@
 const express = require('express');
 const pool    = require('../db');
-const { runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting, scorePcProduct } = require('../jobs/ebay');
+const {
+  runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting,
+  scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
+} = require('../jobs/ebay');
 
 const router = express.Router();
 
@@ -93,14 +96,15 @@ router.post('/refresh-image/:catalog_id', async (req, res) => {
 // GET /api/admin/test-pricecharting
 //   ?name=LeBron+James&year=2003&set_name=Topps+Chrome&card_number=111&condition=raw
 //
-// Phase 1 — endpoint probe: tries every base-URL × endpoint combo with "LeBron James"
-//   to discover which one actually responds with data.  Returns the raw HTTP status
-//   and first 600 chars of every response body so you can see exactly what the API
-//   returns (including error messages).
+// Phase 1 — endpoint probe: hits every base-URL × endpoint combo with "LeBron James"
+//   and returns the raw HTTP status + first 600 chars of every response body so
+//   auth/routing issues are immediately visible.
 //
-// Phase 2 — full price lookup: once we know which endpoint works, runs all query
-//   variations through the two-step flow (search → fetch by product ID) and returns
-//   the winning price + which variation found it.
+// Phase 2 — full price lookup, mirroring fetchPriceCharting() exactly:
+//   sportscardspro.com FIRST (real sports cards), pricecharting.com fallback
+//   (its sports-name search surfaces Funko POP figures).  Per domain, runs all
+//   query variations through the two-step flow (search → fetch by product ID).
+//   Funko/figure console-names are filtered out before scoring.
 //
 // PriceCharting data model:
 //   /api/products?q=  (search)  → [{id, product-name, console-name}]   (no prices)
@@ -139,51 +143,43 @@ router.get('/test-pricecharting', async (req, res) => {
     suffix:     token.slice(-4),
     looks_valid: token.length >= 20,
   };
+  const tEnc        = encodeURIComponent(token);
+  const maskedToken = `${token.slice(0, 4)}***${token.slice(-4)}`;
 
   // ── Phase 1: endpoint probe ───────────────────────────────────────────────
-  // Try every combination of base URL × path × query-param style.
+  // Try every combination of base URL × path, ordered by the same domain
+  // priority the real pricer uses (sportscardspro.com first).
   // Uses a fixed simple query ("LeBron James") so results are comparable.
-  const PROBE_QUERY = 'LeBron James';
-  const tEnc = encodeURIComponent(token);
-  const qEnc = encodeURIComponent(PROBE_QUERY);
+  const qEnc = encodeURIComponent('LeBron James');
 
   const probeTargets = [
-    // pricecharting.com — plural search endpoint (correct for text search)
-    { label: 'PC /api/products (search)',  url: `https://www.pricecharting.com/api/products?t=${tEnc}&q=${qEnc}` },
-    // pricecharting.com — singular endpoint with q= (what we were calling before)
-    { label: 'PC /api/product (search)',   url: `https://www.pricecharting.com/api/product?t=${tEnc}&q=${qEnc}` },
-    // sportscardspro.com — same paths, different domain (sports-card specific mirror)
+    // sportscardspro.com — PRIMARY: indexes actual sports cards
     { label: 'SCP /api/products (search)', url: `https://www.sportscardspro.com/api/products?t=${tEnc}&q=${qEnc}` },
-    { label: 'SCP /api/product (search)',  url: `https://www.sportscardspro.com/api/product?t=${tEnc}&q=${qEnc}` },
+    // pricecharting.com — fallback: sports-name search surfaces Funko POPs
+    { label: 'PC /api/products (search)',  url: `https://www.pricecharting.com/api/products?t=${tEnc}&q=${qEnc}` },
+    // singular endpoint with q= — diagnostic only (not a real search endpoint)
+    { label: 'SCP /api/product (q= probe)', url: `https://www.sportscardspro.com/api/product?t=${tEnc}&q=${qEnc}` },
+    { label: 'PC /api/product (q= probe)',  url: `https://www.pricecharting.com/api/product?t=${tEnc}&q=${qEnc}` },
   ];
 
   const probeResults = [];
-  let searchBase  = null; // base URL that returned products
-  let searchPath  = null; // path that returned products
+  let anyProducts = false;
 
   for (const target of probeTargets) {
-    // Mask token in the URL shown to the caller
-    const displayUrl = target.url.replace(tEnc, `${token.slice(0,4)}***${token.slice(-4)}`);
     const raw = await pcRawFetch(target.url);
-    const entry = {
+    const productsFound = Array.isArray(raw.parsed?.products) ? raw.parsed.products.length : 0;
+    probeResults.push({
       label:       target.label,
-      url:         displayUrl,
+      url:         target.url.replace(tEnc, maskedToken),
       http_status: raw.http_status,
       raw_body:    raw.raw_body,
       error:       raw.error ?? null,
-      products_found: Array.isArray(raw.parsed?.products) ? raw.parsed.products.length : 0,
-    };
-    probeResults.push(entry);
-
-    // First endpoint that returns at least one product wins
-    if (!searchBase && Array.isArray(raw.parsed?.products) && raw.parsed.products.length > 0) {
-      const urlObj = new URL(target.url);
-      searchBase = urlObj.origin;
-      searchPath = urlObj.pathname;
-    }
+      products_found: productsFound,
+    });
+    if (productsFound > 0) anyProducts = true;
   }
 
-  if (!searchBase) {
+  if (!anyProducts) {
     // No endpoint returned data — return the full diagnostic so the caller can
     // see raw status codes + response bodies.
     return res.json({
@@ -194,103 +190,110 @@ router.get('/test-pricecharting', async (req, res) => {
     });
   }
 
-  // ── Phase 2: full two-step price lookup ───────────────────────────────────
-  // Now that we know which endpoint works, run all query variations through:
-  //   1. GET {searchBase}{searchPath}?t=TOKEN&q=QUERY  → get product list + IDs
-  //   2. Pick best product by console-name score
-  //   3. GET {searchBase}/api/product?t=TOKEN&id=ID    → get price data
-  const brandShort = set_name ? set_name.split(/\s+/)[0] : null;
-  const rawVariations = [
-    card_number ? `${name} #${card_number}` : null,
-    [name, year, brandShort].filter(Boolean).join(' '),
-    [name, set_name        ].filter(Boolean).join(' '),
-    [name, year            ].filter(Boolean).join(' '),
-    name,
-  ];
-  const queries = [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
-
+  // ── Phase 2: full two-step price lookup (SCP primary → PC fallback) ───────
+  // Mirrors fetchPriceCharting() exactly — same domain order, same query
+  // variations, same Funko filter, same strict price-field mapping:
+  //   1. GET {base}/api/products?t=TOKEN&q=QUERY  → product list + IDs
+  //   2. Filter Funko/figure console-names, score the rest, pick best
+  //   3. GET {base}/api/product?t=TOKEN&id=ID     → price data
+  const queries = buildPcQueries({ name, year, set_name, card_number });
   const tried = [];
 
-  for (let i = 0; i < queries.length; i++) {
-    const q        = queries[i];
-    const searchUrl = `${searchBase}${searchPath}?t=${tEnc}&q=${encodeURIComponent(q)}`;
-    const displaySearch = searchUrl.replace(tEnc, `${token.slice(0,4)}***${token.slice(-4)}`);
+  for (const baseUrl of PC_BASES) {
+    const host = new URL(baseUrl).hostname.replace(/^www\./, '');
 
-    try {
-      // Step 1: search
-      const searchResp = await fetch(searchUrl, { signal: AbortSignal.timeout(10_000) });
-      const searchText = await searchResp.text();
-      let   searchData = null;
-      try { searchData = JSON.parse(searchText); } catch (_) {}
+    for (let i = 0; i < queries.length; i++) {
+      const q             = queries[i];
+      const searchUrl     = `${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(q)}`;
+      const displaySearch = searchUrl.replace(tEnc, maskedToken);
 
-      if (!searchData || searchData.status !== 'success' || !searchData.products?.length) {
-        tried.push({
-          try: i + 1, query: q, search_url: displaySearch,
-          result: 'no_results',
-          raw_search_body: searchText.slice(0, 300),
-        });
-        continue;
+      try {
+        // Step 1: search
+        const searchResp = await fetch(searchUrl, { signal: AbortSignal.timeout(10_000) });
+        const searchText = await searchResp.text();
+        let   searchData = null;
+        try { searchData = JSON.parse(searchText); } catch (_) {}
+
+        if (!searchData || searchData.status !== 'success' || !searchData.products?.length) {
+          tried.push({
+            base: host, try: i + 1, query: q, search_url: displaySearch,
+            result: 'no_results',
+            raw_search_body: searchText.slice(0, 300),
+          });
+          continue;
+        }
+
+        // Filter Funko/figure listings, then score + pick best product
+        const candidates = searchData.products.filter(p => !PC_JUNK_CONSOLE_RE.test(p['console-name'] ?? ''));
+        if (!candidates.length) {
+          tried.push({
+            base: host, try: i + 1, query: q, search_url: displaySearch,
+            result: 'only_funko_results',
+            total_search_results: searchData.products.length,
+          });
+          continue;
+        }
+        const scored = candidates
+          .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
+          .sort((a, b) => b.score - a.score);
+        const best = scored[0].p;
+        const productId = best.id;
+
+        // Step 2: fetch price by ID
+        const priceUrl     = `${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(productId)}`;
+        const displayPrice = priceUrl.replace(tEnc, maskedToken);
+        const priceResp    = await fetch(priceUrl, { signal: AbortSignal.timeout(10_000) });
+        const priceText    = await priceResp.text();
+        let   priceData    = null;
+        try { priceData = JSON.parse(priceText); } catch (_) {}
+
+        const product = (priceData && priceData.status === 'success') ? priceData : best;
+
+        // Strict mapping: graded → graded-price, raw → loose-price (cents)
+        const cents = condition === 'graded'
+          ? (product['graded-price'] > 0 ? product['graded-price'] : null)
+          : (product['loose-price']  > 0 ? product['loose-price']  : null);
+
+        const entry = {
+          base:             host,
+          try:              i + 1,
+          query:            q,
+          search_url:       displaySearch,
+          price_url:        displayPrice,
+          result:           cents != null ? 'matched' : 'no_price',
+          product_id:       productId,
+          product_name:     product['product-name']  ?? best['product-name'],
+          console_name:     product['console-name']  ?? best['console-name'] ?? null,
+          console_score:    scored[0].score,
+          loose_price:      (product['loose-price']  ?? 0) / 100,
+          cib_price:        (product['cib-price']    ?? 0) / 100,
+          graded_price:     (product['graded-price'] ?? 0) / 100,
+          selected_dollars: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
+          total_search_results: searchData.products.length,
+          funko_filtered:   searchData.products.length - candidates.length,
+          top_candidates: scored.slice(0, 3).map(({ p, score }) => ({
+            id: p.id, product_name: p['product-name'], console_name: p['console-name'] ?? null, score,
+          })),
+          raw_price_body: (priceData && priceData.status === 'success') ? null : priceText.slice(0, 300),
+        };
+        tried.push(entry);
+
+        if (cents != null) {
+          return res.json({
+            ok:             true,
+            winning_base:   host,
+            winning_try:    i + 1,
+            winning_query:  q,
+            slabr_price:    entry.selected_dollars,
+            condition,
+            token_info:     tokenInfo,
+            probe_results:  probeResults,
+            variations:     tried,
+          });
+        }
+      } catch (err) {
+        tried.push({ base: host, try: i + 1, query: q, result: 'error', error: err.message });
       }
-
-      // Score + pick best product
-      const scored = searchData.products
-        .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
-        .sort((a, b) => b.score - a.score);
-      const best = scored[0].p;
-      const productId = best.id;
-
-      // Step 2: fetch price by ID
-      const priceUrl     = `${searchBase}/api/product?t=${tEnc}&id=${encodeURIComponent(productId)}`;
-      const displayPrice = priceUrl.replace(tEnc, `${token.slice(0,4)}***${token.slice(-4)}`);
-      const priceResp    = await fetch(priceUrl, { signal: AbortSignal.timeout(10_000) });
-      const priceText    = await priceResp.text();
-      let   priceData    = null;
-      try { priceData = JSON.parse(priceText); } catch (_) {}
-
-      const product = priceData ?? best; // fall back to search result if price fetch fails
-
-      const cents = condition === 'graded'
-        ? ((product['graded-price'] > 0 ? product['graded-price'] : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null))
-        : ((product['loose-price']  > 0 ? product['loose-price']  : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null));
-
-      const entry = {
-        try:              i + 1,
-        query:            q,
-        search_url:       displaySearch,
-        price_url:        displayPrice,
-        result:           cents != null ? 'matched' : 'no_price',
-        product_id:       productId,
-        product_name:     product['product-name']  ?? best['product-name'],
-        console_name:     product['console-name']  ?? best['console-name'] ?? null,
-        console_score:    scored[0].score,
-        loose_price:      (product['loose-price']  ?? 0) / 100,
-        cib_price:        (product['cib-price']    ?? 0) / 100,
-        graded_price:     (product['graded-price'] ?? 0) / 100,
-        selected_dollars: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
-        total_search_results: searchData.products.length,
-        top_candidates: scored.slice(0, 3).map(({ p, score }) => ({
-          id: p.id, product_name: p['product-name'], console_name: p['console-name'] ?? null, score,
-        })),
-        raw_price_body: priceData ? null : priceText.slice(0, 300), // only if parse failed
-      };
-      tried.push(entry);
-
-      if (cents != null) {
-        return res.json({
-          ok:             true,
-          winning_try:    i + 1,
-          winning_query:  q,
-          slabr_price:    entry.selected_dollars,
-          condition,
-          working_base:   searchBase,
-          working_path:   searchPath,
-          token_info:     tokenInfo,
-          probe_results:  probeResults,
-          variations:     tried,
-        });
-      }
-    } catch (err) {
-      tried.push({ try: i + 1, query: q, result: 'error', error: err.message });
     }
   }
 
@@ -298,8 +301,6 @@ router.get('/test-pricecharting', async (req, res) => {
     ok:            false,
     slabr_price:   null,
     condition,
-    working_base:  searchBase,
-    working_path:  searchPath,
     token_info:    tokenInfo,
     probe_results: probeResults,
     variations:    tried,

@@ -738,22 +738,25 @@ async function ebaySearch(query, limit = 25) {
 
 // ── PriceCharting price lookup ────────────────────────────────────────────────
 //
-// Two-step API flow:
-//   Step 1 (search)   : GET /api/products?t=TOKEN&q=QUERY
-//                         → [{id, product-name, console-name}]  (no prices)
-//   Step 2 (by ID)    : GET /api/product?t=TOKEN&id=PRODUCT_ID
-//                         → {id, product-name, loose-price, cib-price, graded-price, …}
+// Two-step API flow (same API + token on both domains):
+//   Step 1 (search) : GET {base}/api/products?t=TOKEN&q=QUERY
+//                       → [{id, product-name, console-name}]
+//   Step 2 (by ID)  : GET {base}/api/product?t=TOKEN&id=PRODUCT_ID
+//                       → {product-name, loose-price, graded-price, …}
 //
-// Both steps are tried on pricecharting.com first, then sportscardspro.com.
-// The working base URL is auto-detected by whichever returns a product on the
-// first successful warm-up call for a session.
+// Domain priority — sportscardspro.com FIRST:
+//   pricecharting.com's sports-name search surfaces Funko POP figures
+//   ("Funko POP Basketball"), while sportscardspro.com indexes the actual
+//   cards ("Basketball Cards 2003 Topps") with real loose/graded prices.
+//   pricecharting.com remains the fallback for Pokemon/TCG/video games,
+//   which sportscardspro doesn't cover.
 //
 // Prices are in CENTS — divide by 100 for dollars.
 // PriceCharting stores 0 for "no price recorded"; treat as missing.
 //
 // Price-field selection:
-//   graded items    → graded-price, then cib-price as fallback
-//   raw / ungraded  → loose-price,  then cib-price as fallback
+//   graded items    → graded-price
+//   raw / ungraded  → loose-price
 //
 // Query variations (most → least specific):
 //   Try 1: "name #card_number"           → "LeBron James #111"
@@ -763,6 +766,15 @@ async function ebaySearch(query, limit = 25) {
 //   Try 5: "name"                        → "LeBron James"
 //
 // Returns a price in dollars (number) or null when no usable price was found.
+
+const PC_BASES = [
+  'https://www.sportscardspro.com',  // primary — real sports cards
+  'https://www.pricecharting.com',   // fallback — Pokemon / TCG / video games
+];
+
+// Funko POPs and other figure lines share player names with cards on
+// pricecharting.com — never price a card from a figure listing.
+const PC_JUNK_CONSOLE_RE = /\bfunko\b|\bpop!/i;
 
 // Score how well a PriceCharting product's console-name matches our set/year.
 // Higher score = better match; used to rank products when a query returns many.
@@ -779,64 +791,13 @@ function scorePcProduct(product, year, set_name) {
   return score;
 }
 
-// Cached base URL for the current process lifetime.
-// Populated on the first successful search call, reused thereafter.
-let _pcBaseUrl = null;
-let _pcSearchPath = null;
-
-// Discover which base URL + search path combination responds with products.
-// Returns { baseUrl, searchPath } or null if neither works.
-async function discoverPcEndpoint(token) {
-  if (_pcBaseUrl) return { baseUrl: _pcBaseUrl, searchPath: _pcSearchPath };
-
-  const tEnc = encodeURIComponent(token);
-  const qEnc = encodeURIComponent('charizard'); // safe known video-game + card hit
-
-  const candidates = [
-    { baseUrl: 'https://www.pricecharting.com', searchPath: '/api/products' },
-    { baseUrl: 'https://www.sportscardspro.com', searchPath: '/api/products' },
-    { baseUrl: 'https://www.pricecharting.com', searchPath: '/api/product'  },
-    { baseUrl: 'https://www.sportscardspro.com', searchPath: '/api/product'  },
-  ];
-
-  for (const { baseUrl, searchPath } of candidates) {
-    try {
-      const url  = `${baseUrl}${searchPath}?t=${tEnc}&q=${qEnc}`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-      if (!resp.ok) continue;
-      const data = await resp.json().catch(() => null);
-      if (data?.status === 'success' && data.products?.length > 0) {
-        console.log(`[pricecharting] endpoint discovered: ${baseUrl}${searchPath}`);
-        _pcBaseUrl    = baseUrl;
-        _pcSearchPath = searchPath;
-        return { baseUrl, searchPath };
-      }
-    } catch (_) { /* try next */ }
-  }
-
-  return null; // no endpoint worked
-}
-
-async function fetchPriceCharting(item) {
-  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
-  if (!token) return null;
-
-  const { name, year, set_name, card_number, condition } = item;
-
-  // Auto-detect which endpoint / base URL works for this token
-  const endpoint = await discoverPcEndpoint(token);
-  if (!endpoint) {
-    console.warn('[pricecharting] endpoint discovery failed — token may be invalid or no internet');
-    return null;
-  }
-  const { baseUrl, searchPath } = endpoint;
-  const tEnc = encodeURIComponent(token);
-
+// Build the deduplicated query-variation ladder for an item (most → least specific).
+function buildPcQueries(item) {
+  const { name, year, set_name, card_number } = item;
   // First word of set_name used as the short brand token
   // e.g. "Topps Chrome" → "Topps",  "Panini Prizm" → "Panini"
   const brandShort = set_name ? set_name.trim().split(/\s+/)[0] : null;
 
-  // Build query variations from most to least specific; filter blanks then deduplicate.
   const rawVariations = [
     card_number ? `${name} #${card_number}` : null,
     [name, year, brandShort].filter(Boolean).join(' '),
@@ -844,15 +805,24 @@ async function fetchPriceCharting(item) {
     [name, year].filter(Boolean).join(' '),
     name,
   ];
-  const queries = [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
+  return [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
+}
+
+// Run the full query-variation ladder against one domain.
+// Returns a price in dollars or null.
+async function pcLookupOnBase(baseUrl, item, token) {
+  const { year, set_name, condition } = item;
+  const tEnc    = encodeURIComponent(token);
+  const queries = buildPcQueries(item);
+  const host    = new URL(baseUrl).hostname.replace(/^www\./, '');
 
   for (let i = 0; i < queries.length; i++) {
     const q      = queries[i];
-    const tryTag = `try ${i + 1}/${queries.length}`;
+    const tryTag = `${host} try ${i + 1}/${queries.length}`;
 
     try {
       // ── Step 1: search for products matching the query ──────────────────
-      const searchUrl = `${baseUrl}${searchPath}?t=${tEnc}&q=${encodeURIComponent(q)}`;
+      const searchUrl = `${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(q)}`;
       console.log(`[pricecharting] ${tryTag}: search "${q}" (condition=${condition ?? 'raw'})`);
 
       const searchResp = await fetch(searchUrl, { signal: AbortSignal.timeout(10_000) });
@@ -867,8 +837,13 @@ async function fetchPriceCharting(item) {
         continue;
       }
 
-      // Score products by console-name match and pick the best one.
-      const scored = searchData.products
+      // Drop Funko/figure listings, then score by console-name match.
+      const candidates = searchData.products.filter(p => !PC_JUNK_CONSOLE_RE.test(p['console-name'] ?? ''));
+      if (!candidates.length) {
+        console.log(`[pricecharting] ${tryTag}: only Funko/figure results — skipping`);
+        continue;
+      }
+      const scored = candidates
         .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
         .sort((a, b) => b.score - a.score);
       const best = scored[0].p;
@@ -890,18 +865,14 @@ async function fetchPriceCharting(item) {
         }
       }
 
-      // Select the price field appropriate for the item's condition.
-      let cents = null;
-      if (condition === 'graded') {
-        cents = (product['graded-price'] > 0 ? product['graded-price'] : null)
-             ?? (product['cib-price']    > 0 ? product['cib-price']    : null);
-      } else {
-        cents = (product['loose-price'] > 0 ? product['loose-price'] : null)
-             ?? (product['cib-price']   > 0 ? product['cib-price']   : null);
-      }
+      // Strict field mapping: graded → graded-price, raw → loose-price.
+      // Values are cents; 0 means "no price recorded".
+      const cents = condition === 'graded'
+        ? (product['graded-price'] > 0 ? product['graded-price'] : null)
+        : (product['loose-price']  > 0 ? product['loose-price']  : null);
 
       if (cents == null) {
-        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? 'no console'}) found but all price fields are zero — skipping`);
+        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? '?'}) has no ${condition === 'graded' ? 'graded' : 'loose'}-price — skipping`);
         continue;
       }
 
@@ -915,7 +886,20 @@ async function fetchPriceCharting(item) {
     }
   }
 
-  console.log(`[pricecharting] all ${queries.length} query variations exhausted — no usable price`);
+  return null;
+}
+
+async function fetchPriceCharting(item) {
+  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  if (!token) return null;
+
+  // sportscardspro.com first; pricecharting.com only when it yields nothing.
+  for (const baseUrl of PC_BASES) {
+    const price = await pcLookupOnBase(baseUrl, item, token);
+    if (price != null) return price;
+  }
+
+  console.log('[pricecharting] all domains and query variations exhausted — no usable price');
   return null;
 }
 
@@ -1033,4 +1017,7 @@ async function priceSingleItem(catalogId, condition, grade) {
   return { soldMedian, activeLow };
 }
 
-module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchPriceCharting, scorePcProduct };
+module.exports = {
+  runEbayJob, ebaySearch, priceSingleItem, fetchCardImage,
+  fetchPriceCharting, scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
+};
