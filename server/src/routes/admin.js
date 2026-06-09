@@ -1,6 +1,6 @@
 const express = require('express');
 const pool    = require('../db');
-const { runEbayJob, priceSingleItem, fetchCardImage } = require('../jobs/ebay');
+const { runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting } = require('../jobs/ebay');
 
 const router = express.Router();
 
@@ -85,6 +85,60 @@ router.post('/refresh-image/:catalog_id', async (req, res) => {
     res.json({ ok: true, catalog_id: catalogId, image_url: imageUrl });
   } catch (err) {
     console.error('[admin refresh-image]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PriceCharting connectivity test ──────────────────────────────────────────
+// GET /api/admin/test-pricecharting?q=LeBron+James+2003+Topps&condition=raw
+// Returns the raw PC response + the price Slabr would actually use.
+// Safe to call repeatedly — read-only, no DB writes.
+
+router.get('/test-pricecharting', async (req, res) => {
+  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  if (!token) {
+    return res.status(503).json({ error: 'PRICE_CHARTING_TOKEN is not set in the environment' });
+  }
+
+  const q         = (req.query.q ?? 'LeBron James 2003 Topps Chrome').trim();
+  const condition = req.query.condition === 'graded' ? 'graded' : 'raw';
+
+  try {
+    const url  = `https://www.pricecharting.com/api/product?t=${encodeURIComponent(token)}&q=${encodeURIComponent(q)}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const data = await resp.json();
+
+    if (data.status !== 'success' || !data.products?.length) {
+      return res.json({ ok: false, query: q, status: data.status, products: [] });
+    }
+
+    const product = data.products[0];
+    const cents   = condition === 'graded'
+      ? ((product['graded-price'] > 0 ? product['graded-price'] : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null))
+      : ((product['loose-price']  > 0 ? product['loose-price']  : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null));
+
+    const selectedPrice = cents != null ? parseFloat((cents / 100).toFixed(2)) : null;
+
+    // Also show fetchPriceCharting's actual return value for full e2e confirmation
+    const slabr_price = await fetchPriceCharting({ name: q, condition });
+
+    res.json({
+      ok: true,
+      query: q,
+      condition,
+      top_match: {
+        'product-name':  product['product-name'],
+        'loose-price':   (product['loose-price']  ?? 0) / 100,
+        'cib-price':     (product['cib-price']    ?? 0) / 100,
+        'graded-price':  (product['graded-price'] ?? 0) / 100,
+      },
+      selected_field:    condition === 'graded' ? 'graded-price (cib fallback)' : 'loose-price (cib fallback)',
+      selected_cents:    cents,
+      selected_dollars:  selectedPrice,
+      slabr_price,        // what priceSingleItem would actually record
+      total_results:     data.products.length,
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

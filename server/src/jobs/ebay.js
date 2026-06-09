@@ -920,4 +920,4 @@ async function priceSingleItem(catalogId, condition, grade) {
   return { soldMedian, activeLow };
 }
 
-module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage };
+module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchPriceCharting };
