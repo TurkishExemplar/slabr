@@ -7,8 +7,8 @@
  * Requires PRICE_CHARTING_TOKEN in .env (or set inline):
  *   PRICE_CHARTING_TOKEN=xxx node test-pricecharting.js
  *
- * Tests fetchPriceCharting() against known cards and prints
- * what price Slabr would store in price_history.
+ * Tests fetchPriceCharting() against known cards using all three
+ * query variations and prints which one matched.
  */
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
@@ -23,13 +23,13 @@ if (!(process.env.PRICE_CHARTING_TOKEN ?? '').trim()) {
 }
 
 const TEST_CARDS = [
-  // A well-known rookie RC — should have strong loose + graded prices
-  { name: 'LeBron James 2003 Topps Chrome', year: 2003, set_name: 'Topps Chrome', condition: 'raw'    },
-  { name: 'LeBron James 2003 Topps Chrome', year: 2003, set_name: 'Topps Chrome', condition: 'graded' },
-  // A more niche card — tests graceful null return when no price is recorded
-  { name: 'Stephen Curry 2009 Topps',       year: 2009, set_name: 'Topps',        condition: 'graded' },
-  // Pokemon — tests non-sports-card path
-  { name: 'Charizard',                      year: 1999, set_name: 'Base Set',      condition: 'raw'    },
+  // Sports cards — well-indexed on PriceCharting
+  { name: 'LeBron James', year: 2003, set_name: 'Topps Chrome',  condition: 'raw'    },
+  { name: 'LeBron James', year: 2003, set_name: 'Topps Chrome',  condition: 'graded' },
+  { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        condition: 'graded' },
+  { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome', condition: 'raw'    },
+  // Pokemon
+  { name: 'Charizard',     year: 1999, set_name: 'Base Set',     condition: 'raw'    },
 ];
 
 async function run() {
@@ -39,15 +39,15 @@ async function run() {
   let failed = 0;
 
   for (const card of TEST_CARDS) {
-    const label = `${card.name} (${card.condition})`;
+    const label = `${card.name} ${card.year ?? ''} ${card.set_name ?? ''} (${card.condition})`.trim();
     try {
       const price = await fetchPriceCharting(card);
       if (price != null && price > 0) {
         console.log(`  ✓  ${label}\n     → $${price.toFixed(2)}\n`);
         passed++;
       } else {
-        console.log(`  –  ${label}\n     → no price returned (null) — will fall back to eBay\n`);
-        passed++; // null is a valid / expected result
+        console.log(`  –  ${label}\n     → null (no price on PriceCharting — eBay fallback will be used)\n`);
+        passed++; // null is valid — eBay fallback handles it
       }
     } catch (err) {
       console.error(`  ✗  ${label}\n     → ERROR: ${err.message}\n`);

@@ -752,58 +752,85 @@ async function ebaySearch(query, limit = 25) {
 //   raw / ungraded → loose-price (played/raw value)
 //                   → cib-price  (near-mint) as fallback
 //
+// Query strategy — PriceCharting search is literal, so long/combined strings
+// often return empty arrays.  We try three progressively shorter variations
+// and return the first one that yields a non-zero price:
+//
+//   Try 1: name + year + first word of set_name  → "LeBron James 2003 Topps"
+//   Try 2: name + full set_name (no year)        → "LeBron James Topps Chrome"
+//   Try 3: name + year only                      → "LeBron James 2003"
+//
 // Returns a price in dollars (number) or null when no usable price was found.
 async function fetchPriceCharting(item) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
   if (!token) return null;
 
   const { name, year, set_name, condition } = item;
-  // Build query from name + year + set — mirrors the example in the integration spec.
-  const q = [name, year, set_name].filter(Boolean).join(' ');
 
-  try {
-    const url = `https://www.pricecharting.com/api/product?t=${encodeURIComponent(token)}&q=${encodeURIComponent(q)}`;
-    console.log(`[pricecharting] Searching: "${q}" (condition=${condition ?? 'raw'})`);
+  // First word of set_name used as the short brand token
+  // e.g. "Topps Chrome" → "Topps",  "Panini Prizm" → "Panini"
+  const brandShort = set_name ? set_name.trim().split(/\s+/)[0] : null;
 
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) {
-      console.warn(`[pricecharting] HTTP ${res.status} for "${q}"`);
-      return null;
+  // Build the three query variations; filter out blanks then deduplicate
+  // (dedup matters when set_name is null and variations 1 & 3 would be identical)
+  const rawVariations = [
+    [name, year, brandShort].filter(Boolean).join(' '),   // Try 1
+    [name, set_name        ].filter(Boolean).join(' '),   // Try 2
+    [name, year            ].filter(Boolean).join(' '),   // Try 3
+  ];
+  const queries = [...new Set(rawVariations.map(q => q.trim()).filter(Boolean))];
+
+  for (let i = 0; i < queries.length; i++) {
+    const q      = queries[i];
+    const tryTag = `try ${i + 1}/${queries.length}`;
+
+    try {
+      const url = `https://www.pricecharting.com/api/product?t=${encodeURIComponent(token)}&q=${encodeURIComponent(q)}`;
+      console.log(`[pricecharting] ${tryTag}: "${q}" (condition=${condition ?? 'raw'})`);
+
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) {
+        console.warn(`[pricecharting] ${tryTag} HTTP ${res.status} — skipping`);
+        continue;
+      }
+
+      const data = await res.json();
+      if (data.status !== 'success' || !data.products?.length) {
+        console.log(`[pricecharting] ${tryTag}: no results`);
+        continue;
+      }
+
+      // First result is PriceCharting's best relevance match.
+      const product = data.products[0];
+
+      // Select the price field appropriate for the item's condition.
+      // Null-coalesce: use the first field that has a positive value.
+      let cents = null;
+      if (condition === 'graded') {
+        cents = (product['graded-price'] > 0 ? product['graded-price'] : null)
+             ?? (product['cib-price']    > 0 ? product['cib-price']    : null);
+      } else {
+        cents = (product['loose-price'] > 0 ? product['loose-price'] : null)
+             ?? (product['cib-price']   > 0 ? product['cib-price']   : null);
+      }
+
+      if (cents == null) {
+        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" found but all price fields are zero — skipping`);
+        continue;
+      }
+
+      const price = parseFloat((cents / 100).toFixed(2));
+      console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" — $${price} via "${q}"`);
+      return price;
+
+    } catch (err) {
+      console.error(`[pricecharting] ${tryTag} error for "${q}": ${err.message}`);
+      // fall through to next variation
     }
-
-    const data = await res.json();
-    if (data.status !== 'success' || !Array.isArray(data.products) || !data.products.length) {
-      console.log(`[pricecharting] No results for "${q}"`);
-      return null;
-    }
-
-    // First result is PriceCharting's best relevance match.
-    const product = data.products[0];
-
-    // Select the price field appropriate for the item's condition.
-    // Null-coalesce: use the first field that has a positive value.
-    let cents = null;
-    if (condition === 'graded') {
-      cents = (product['graded-price'] > 0 ? product['graded-price'] : null)
-           ?? (product['cib-price']    > 0 ? product['cib-price']    : null);
-    } else {
-      cents = (product['loose-price'] > 0 ? product['loose-price'] : null)
-           ?? (product['cib-price']   > 0 ? product['cib-price']   : null);
-    }
-
-    if (cents == null) {
-      console.log(`[pricecharting] "${product['product-name']}" — no usable price (all fields zero or absent)`);
-      return null;
-    }
-
-    const price = parseFloat((cents / 100).toFixed(2));
-    console.log(`[pricecharting] "${product['product-name']}" — $${price} (${cents} cents, ${condition === 'graded' ? 'graded-price' : 'loose-price'} field)`);
-    return price;
-
-  } catch (err) {
-    console.error(`[pricecharting] Error for "${q}": ${err.message}`);
-    return null;
   }
+
+  console.log(`[pricecharting] all ${queries.length} query variations exhausted — no usable price`);
+  return null;
 }
 
 // ── Instant single-item pricer (called right after a portfolio add) ───────────
