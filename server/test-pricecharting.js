@@ -24,12 +24,13 @@ if (!(process.env.PRICE_CHARTING_TOKEN ?? '').trim()) {
 
 const TEST_CARDS = [
   // Sports cards — well-indexed on PriceCharting
-  { name: 'LeBron James', year: 2003, set_name: 'Topps Chrome',  condition: 'raw'    },
-  { name: 'LeBron James', year: 2003, set_name: 'Topps Chrome',  condition: 'graded' },
-  { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        condition: 'graded' },
-  { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome', condition: 'raw'    },
+  // card_number helps the #1 query variation ("LeBron James #111") hit product-name directly
+  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'raw'    },
+  { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'graded' },
+  { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        card_number: '321', condition: 'graded' },
+  { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome',                     condition: 'raw'    },
   // Pokemon
-  { name: 'Charizard',     year: 1999, set_name: 'Base Set',     condition: 'raw'    },
+  { name: 'Charizard',     year: 1999, set_name: 'Base Set',                         condition: 'raw'    },
 ];
 
 async function run() {

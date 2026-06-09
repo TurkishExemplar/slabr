@@ -1,6 +1,6 @@
 const express = require('express');
 const pool    = require('../db');
-const { runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting } = require('../jobs/ebay');
+const { runEbayJob, priceSingleItem, fetchCardImage, fetchPriceCharting, scorePcProduct } = require('../jobs/ebay');
 
 const router = express.Router();
 
@@ -91,13 +91,16 @@ router.post('/refresh-image/:catalog_id', async (req, res) => {
 
 // ── PriceCharting connectivity test ──────────────────────────────────────────
 // GET /api/admin/test-pricecharting
-//   ?name=LeBron+James&year=2003&set_name=Topps+Chrome&condition=raw
+//   ?name=LeBron+James&year=2003&set_name=Topps+Chrome&card_number=111&condition=raw
 //
-// Runs all three query variations in order and returns per-variation results
-// so you can see which format PriceCharting responds to.  Read-only, no DB writes.
+// Mirrors the exact query-variation order and product-scoring logic used by
+// fetchPriceCharting() so you can see which variation wins and which product
+// is selected.  Read-only, no DB writes.
 //
-// Shortcut: pass ?name=LeBron+James+2003+Topps+Chrome with no year/set_name
-// to treat the whole string as the name (mirrors how a scan card would look).
+// PriceCharting data model (sportscardspro mirrors it):
+//   product-name : "LeBron James #111"               (player + card#)
+//   console-name : "Basketball Cards 2003 Topps Chrome" (category + year + set)
+// The console-name score column shows how well each result matched your year/set.
 
 router.get('/test-pricecharting', async (req, res) => {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
@@ -105,18 +108,23 @@ router.get('/test-pricecharting', async (req, res) => {
     return res.status(503).json({ error: 'PRICE_CHARTING_TOKEN is not set in the environment' });
   }
 
-  const name      = (req.query.name  ?? 'LeBron James').trim();
-  const year      = req.query.year   ? parseInt(req.query.year,  10) : null;
-  const set_name  = (req.query.set_name  ?? '').trim() || null;
-  const condition = req.query.condition === 'graded' ? 'graded' : 'raw';
+  const name        = (req.query.name        ?? 'LeBron James').trim();
+  const year        = req.query.year         ? parseInt(req.query.year, 10) : null;
+  const set_name    = (req.query.set_name    ?? '').trim() || null;
+  const card_number = (req.query.card_number ?? '').trim() || null;
+  const condition   = req.query.condition === 'graded' ? 'graded' : 'raw';
 
   const brandShort = set_name ? set_name.split(/\s+/)[0] : null;
 
-  const queries = [...new Set([
+  // Same variation order as fetchPriceCharting
+  const rawVariations = [
+    card_number ? `${name} #${card_number}` : null,
     [name, year, brandShort].filter(Boolean).join(' '),
     [name, set_name        ].filter(Boolean).join(' '),
     [name, year            ].filter(Boolean).join(' '),
-  ].map(q => q.trim()).filter(Boolean))];
+    name,
+  ];
+  const queries = [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
 
   const tried = [];
 
@@ -132,33 +140,45 @@ router.get('/test-pricecharting', async (req, res) => {
         continue;
       }
 
-      const product = data.products[0];
-      const cents   = condition === 'graded'
+      // Score + pick best product (mirrors fetchPriceCharting logic)
+      const scored = data.products
+        .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
+        .sort((a, b) => b.score - a.score);
+      const product = scored[0].p;
+
+      const cents = condition === 'graded'
         ? ((product['graded-price'] > 0 ? product['graded-price'] : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null))
         : ((product['loose-price']  > 0 ? product['loose-price']  : null) ?? (product['cib-price'] > 0 ? product['cib-price'] : null));
 
       const entry = {
-        try:           i + 1,
-        query:         q,
-        result:        cents != null ? 'matched' : 'no_price',
-        product_name:  product['product-name'],
-        loose_price:   (product['loose-price']  ?? 0) / 100,
-        cib_price:     (product['cib-price']    ?? 0) / 100,
-        graded_price:  (product['graded-price'] ?? 0) / 100,
+        try:              i + 1,
+        query:            q,
+        result:           cents != null ? 'matched' : 'no_price',
+        product_name:     product['product-name'],
+        console_name:     product['console-name'] ?? null,
+        console_score:    scored[0].score,
+        loose_price:      (product['loose-price']  ?? 0) / 100,
+        cib_price:        (product['cib-price']    ?? 0) / 100,
+        graded_price:     (product['graded-price'] ?? 0) / 100,
         selected_dollars: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
-        total_results: data.products.length,
+        total_results:    data.products.length,
+        // Show all top-3 candidates so you can verify the scorer is picking correctly
+        top_candidates: scored.slice(0, 3).map(({ p, score }) => ({
+          product_name: p['product-name'],
+          console_name: p['console-name'] ?? null,
+          score,
+        })),
       };
       tried.push(entry);
 
       if (cents != null) {
-        // First variation with a real price — this is what fetchPriceCharting returns
         return res.json({
-          ok:           true,
-          winning_try:  i + 1,
+          ok:            true,
+          winning_try:   i + 1,
           winning_query: q,
-          slabr_price:  entry.selected_dollars,
+          slabr_price:   entry.selected_dollars,
           condition,
-          variations:   tried,
+          variations:    tried,
         });
       }
     } catch (err) {

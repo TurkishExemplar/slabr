@@ -752,33 +752,63 @@ async function ebaySearch(query, limit = 25) {
 //   raw / ungraded → loose-price (played/raw value)
 //                   → cib-price  (near-mint) as fallback
 //
-// Query strategy — PriceCharting search is literal, so long/combined strings
-// often return empty arrays.  We try three progressively shorter variations
-// and return the first one that yields a non-zero price:
+// PriceCharting's internal data model (mirrored on sportscardspro.com):
+//   product-name: "LeBron James #111"               (player + card number)
+//   console-name: "Basketball Cards 2003 Topps Chrome" (category + year + set)
 //
-//   Try 1: name + year + first word of set_name  → "LeBron James 2003 Topps"
-//   Try 2: name + full set_name (no year)        → "LeBron James Topps Chrome"
-//   Try 3: name + year only                      → "LeBron James 2003"
+// Query strategy — the API's ?q= searches product-name, so "name #cardno" is
+// the most reliable hit.  We try progressively broader queries until one returns
+// a non-zero price, then score results by how well their console-name matches
+// our set_name/year so we always return the right card when a name has many sets.
+//
+//   Try 1: name + "#card_number" (if known)  → "LeBron James #111"
+//   Try 2: name + year + first word of set   → "LeBron James 2003 Topps"
+//   Try 3: name + full set_name              → "LeBron James Topps Chrome"
+//   Try 4: name + year only                  → "LeBron James 2003"
+//   Try 5: name only (last resort)           → "LeBron James"
 //
 // Returns a price in dollars (number) or null when no usable price was found.
+
+// Score how well a PriceCharting product's console-name matches our set/year.
+// Higher score = better match; used to rank products when a query returns many.
+function scorePcProduct(product, year, set_name) {
+  const consoleName = (product['console-name'] ?? '').toLowerCase();
+  let score = 0;
+  if (year && consoleName.includes(String(year))) score += 3;
+  if (set_name) {
+    const setParts = set_name.toLowerCase().split(/\s+/);
+    for (const part of setParts) {
+      if (part.length > 2 && consoleName.includes(part)) score += 2;
+    }
+  }
+  return score;
+}
+
 async function fetchPriceCharting(item) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
   if (!token) return null;
 
-  const { name, year, set_name, condition } = item;
+  const { name, year, set_name, card_number, condition } = item;
 
   // First word of set_name used as the short brand token
   // e.g. "Topps Chrome" → "Topps",  "Panini Prizm" → "Panini"
   const brandShort = set_name ? set_name.trim().split(/\s+/)[0] : null;
 
-  // Build the three query variations; filter out blanks then deduplicate
-  // (dedup matters when set_name is null and variations 1 & 3 would be identical)
+  // Build query variations from most to least specific; filter blanks then deduplicate.
+  // Variation order matters: the first variation that yields a usable price wins.
   const rawVariations = [
-    [name, year, brandShort].filter(Boolean).join(' '),   // Try 1
-    [name, set_name        ].filter(Boolean).join(' '),   // Try 2
-    [name, year            ].filter(Boolean).join(' '),   // Try 3
+    // Try 1 — most specific: name + card number (matches product-name directly)
+    card_number ? `${name} #${card_number}` : null,
+    // Try 2 — name + year + brand (e.g. "LeBron James 2003 Topps")
+    [name, year, brandShort].filter(Boolean).join(' '),
+    // Try 3 — name + full set (e.g. "LeBron James Topps Chrome")
+    [name, set_name].filter(Boolean).join(' '),
+    // Try 4 — name + year only (e.g. "LeBron James 2003")
+    [name, year].filter(Boolean).join(' '),
+    // Try 5 — name only as last resort (PC's API returns many; we score to pick best)
+    name,
   ];
-  const queries = [...new Set(rawVariations.map(q => q.trim()).filter(Boolean))];
+  const queries = [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
 
   for (let i = 0; i < queries.length; i++) {
     const q      = queries[i];
@@ -800,8 +830,12 @@ async function fetchPriceCharting(item) {
         continue;
       }
 
-      // First result is PriceCharting's best relevance match.
-      const product = data.products[0];
+      // Score products by console-name match and pick the best one.
+      // Falls back to products[0] (PC's relevance-ranked first result) when scores tie.
+      const scored = data.products
+        .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
+        .sort((a, b) => b.score - a.score);
+      const product = scored[0].p;
 
       // Select the price field appropriate for the item's condition.
       // Null-coalesce: use the first field that has a positive value.
@@ -815,12 +849,12 @@ async function fetchPriceCharting(item) {
       }
 
       if (cents == null) {
-        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" found but all price fields are zero — skipping`);
+        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? 'no console'}) found but all price fields are zero — skipping`);
         continue;
       }
 
       const price = parseFloat((cents / 100).toFixed(2));
-      console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" — $${price} via "${q}"`);
+      console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" | ${product['console-name'] ?? '?'} — $${price} via "${q}"`);
       return price;
 
     } catch (err) {
@@ -947,4 +981,4 @@ async function priceSingleItem(catalogId, condition, grade) {
   return { soldMedian, activeLow };
 }
 
-module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchPriceCharting };
+module.exports = { runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchPriceCharting, scorePcProduct };
