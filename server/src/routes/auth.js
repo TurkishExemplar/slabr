@@ -213,6 +213,32 @@ router.post('/reset-password', authLimiter, async (req, res) => {
   }
 });
 
+// GET /api/auth/jwt-debug — no auth required
+// Self-test: signs a throwaway token then immediately verifies it using
+// whatever JWT_SECRET is live in memory.  Safe to leave in — it never
+// exposes the secret value, only its length and a round-trip result.
+router.get('/jwt-debug', (req, res) => {
+  const secret = process.env.JWT_SECRET ?? '';
+  if (!secret) {
+    return res.json({ ok: false, secret_set: false, error: 'JWT_SECRET is not set' });
+  }
+  try {
+    const testToken = jwt.sign({ _debug: true }, secret, { expiresIn: '60s' });
+    const verified  = jwt.verify(testToken, secret);
+    res.json({
+      ok:            true,
+      secret_set:    true,
+      secret_length: secret.length,
+      round_trip:    verified._debug === true,
+      // First 4 chars of the token header helps confirm which secret is live
+      // (same prefix = same secret; different prefix = different secret)
+      token_prefix:  testToken.slice(0, 20),
+    });
+  } catch (err) {
+    res.json({ ok: false, secret_set: true, secret_length: secret.length, error: err.message });
+  }
+});
+
 // GET /api/auth/me
 router.get('/me', authMiddleware, async (req, res) => {
   try {
