@@ -238,6 +238,94 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// ── Image-type helper ─────────────────────────────────────────────────────────
+// Checks actual file-header magic bytes — not the client-supplied MIME string.
+function detectImageType(base64) {
+  try {
+    const h = Buffer.from(base64.slice(0, 24), 'base64');
+    if (h[0] === 0xFF && h[1] === 0xD8 && h[2] === 0xFF) return 'image/jpeg';
+    if (h[0] === 0x89 && h[1] === 0x50 && h[2] === 0x4E && h[3] === 0x47) return 'image/png';
+    if (h[0] === 0x47 && h[1] === 0x49 && h[2] === 0x46) return 'image/gif';
+    if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46 &&
+        h[8] === 0x57 && h[9] === 0x45 && h[10] === 0x42 && h[11] === 0x50) return 'image/webp';
+    return null;
+  } catch { return null; }
+}
+
+// POST /api/portfolio/:id/image — replace the catalog image with a user upload
+router.post('/:id/image', async (req, res) => {
+  const { image_base64 } = req.body ?? {};
+  if (!image_base64) return res.status(400).json({ error: 'image_base64 is required' });
+
+  // Verify ownership and retrieve catalog_id
+  const ownerRes = await pool.query(
+    'SELECT catalog_id FROM portfolio_items WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.userId]
+  );
+  if (!ownerRes.rows.length) return res.status(404).json({ error: 'Item not found' });
+  const { catalog_id } = ownerRes.rows[0];
+
+  const base64 = image_base64.replace(/^data:[^;]+;base64,/, '');
+
+  // Basic well-formedness check
+  if (base64.length < 8 || !/^[A-Za-z0-9+/]/.test(base64)) {
+    return res.status(400).json({ error: 'Only image files are accepted' });
+  }
+
+  // 5 MB decoded-size limit
+  if (Math.floor((base64.length * 3) / 4) > 5 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Image too large — maximum 5MB' });
+  }
+
+  // Magic-byte file-type check
+  if (!detectImageType(base64)) {
+    return res.status(400).json({ error: 'Only image files are accepted' });
+  }
+
+  try {
+    await pool.query(
+      'UPDATE master_catalog SET image_url = $1 WHERE id = $2',
+      [image_base64, catalog_id]
+    );
+    res.json({ ok: true, image_url: image_base64 });
+  } catch (err) {
+    console.error('[portfolio image upload]', err.message);
+    res.status(500).json({ error: 'Image update failed — please try again' });
+  }
+});
+
+// PATCH /api/portfolio/:id/name — rename the catalog entry
+router.patch('/:id/name', async (req, res) => {
+  let { name } = req.body ?? {};
+
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ error: 'name is required' });
+  }
+
+  // Strip HTML tags then trim
+  name = name.replace(/<[^>]*>/g, '').trim();
+
+  if (name.length < 3 || name.length > 200) {
+    return res.status(400).json({ error: 'Name must be between 3 and 200 characters' });
+  }
+
+  // Verify ownership and retrieve catalog_id
+  const ownerRes = await pool.query(
+    'SELECT catalog_id FROM portfolio_items WHERE id = $1 AND user_id = $2',
+    [req.params.id, req.user.userId]
+  );
+  if (!ownerRes.rows.length) return res.status(404).json({ error: 'Item not found' });
+  const { catalog_id } = ownerRes.rows[0];
+
+  try {
+    await pool.query('UPDATE master_catalog SET name = $1 WHERE id = $2', [name, catalog_id]);
+    res.json({ ok: true, name });
+  } catch (err) {
+    console.error('[portfolio name update]', err.message);
+    res.status(500).json({ error: 'Name update failed — please try again' });
+  }
+});
+
 // DELETE /api/portfolio/:id
 router.delete('/:id', async (req, res) => {
   try {

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -68,6 +68,19 @@ export default function Item() {
   const [manualValueInput, setManualValueInput]     = useState('');
   const [savingManualValue, setSavingManualValue]   = useState(false);
 
+  // Custom image upload
+  const [uploadingImg, setUploadingImg]             = useState(false);
+
+  // Inline name editing
+  const [editingName, setEditingName]               = useState(false);
+  const [nameInput, setNameInput]                   = useState('');
+  const [savingName, setSavingName]                 = useState(false);
+  const [nameToast, setNameToast]                   = useState(null);
+
+  // DOM refs
+  const fileInputRef  = useRef(null);
+  const nameInputRef  = useRef(null);
+
   useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
     fetch(`${API}/api/portfolio/${id}`, { headers })
@@ -91,6 +104,11 @@ export default function Item() {
       .catch(err => setError(err.message))
       .finally(() => setLoading(false));
   }, [id, token]);
+
+  // Auto-focus the name input whenever the inline editor opens
+  useEffect(() => {
+    if (editingName) nameInputRef.current?.focus();
+  }, [editingName]);
 
   const chartData = useMemo(() => {
     if (!priceHistory.length) return [];
@@ -128,6 +146,59 @@ export default function Item() {
       setRefreshingImg(false);
       setTimeout(() => setImgRefreshMsg(null), 4000);
     }
+  }
+
+  function handleImageUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const ALLOWED = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    if (!ALLOWED.includes(file.type)) {
+      setImgRefreshMsg('Only JPEG, PNG, and WebP images are accepted');
+      setTimeout(() => setImgRefreshMsg(null), 4000);
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setImgRefreshMsg('Image too large — maximum 5MB');
+      setTimeout(() => setImgRefreshMsg(null), 4000);
+      e.target.value = '';
+      return;
+    }
+
+    setUploadingImg(true);
+    setImgRefreshMsg(null);
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const res = await fetch(`${API}/api/portfolio/${id}/image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ image_base64: event.target.result }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          setItem(prev => ({ ...prev, image_url: data.image_url }));
+          setImgRefreshMsg('Image updated ✓');
+        } else {
+          setImgRefreshMsg(data.error ?? 'Image update failed — please try again');
+        }
+      } catch {
+        setImgRefreshMsg('Image update failed — please try again');
+      } finally {
+        setUploadingImg(false);
+        setTimeout(() => setImgRefreshMsg(null), 4000);
+        e.target.value = '';
+      }
+    };
+    reader.onerror = () => {
+      setImgRefreshMsg('Image update failed — please try again');
+      setUploadingImg(false);
+      setTimeout(() => setImgRefreshMsg(null), 4000);
+      e.target.value = '';
+    };
+    reader.readAsDataURL(file);
   }
 
   async function handleSave() {
@@ -182,6 +253,38 @@ export default function Item() {
       alert(err.message);
     } finally {
       setSavingManualValue(false);
+    }
+  }
+
+  async function handleSaveName() {
+    const trimmed = nameInput.trim();
+    if (trimmed.length < 3 || trimmed.length > 200) {
+      setNameToast({ type: 'error', text: 'Name must be 3–200 characters' });
+      setTimeout(() => setNameToast(null), 3000);
+      return;
+    }
+    setSavingName(true);
+    try {
+      const res = await fetch(`${API}/api/portfolio/${id}/name`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setItem(prev => ({ ...prev, name: data.name }));
+        setEditingName(false);
+        setNameToast({ type: 'ok', text: 'Card name updated' });
+        setTimeout(() => setNameToast(null), 3000);
+      } else {
+        setNameToast({ type: 'error', text: data.error ?? 'Name update failed — please try again' });
+        setTimeout(() => setNameToast(null), 3000);
+      }
+    } catch {
+      setNameToast({ type: 'error', text: 'Name update failed — please try again' });
+      setTimeout(() => setNameToast(null), 3000);
+    } finally {
+      setSavingName(false);
     }
   }
 
@@ -302,15 +405,31 @@ export default function Item() {
               }
             </div>
 
-            {/* Refresh Image */}
+            {/* Image controls */}
             <div className="flex flex-col items-center gap-1">
-              <button
-                onClick={handleRefreshImage}
-                disabled={refreshingImg}
-                className="w-full py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {refreshingImg ? 'Refreshing…' : '↻ Refresh Image'}
-              </button>
+              <div className="flex gap-2 w-full">
+                <button
+                  onClick={handleRefreshImage}
+                  disabled={refreshingImg || uploadingImg}
+                  className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {refreshingImg ? 'Refreshing…' : '↻ Refresh Image'}
+                </button>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploadingImg || refreshingImg}
+                  className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {uploadingImg ? 'Uploading…' : '↑ Update Image'}
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/jpg,image/png,image/webp"
+                  className="hidden"
+                  onChange={handleImageUpload}
+                />
+              </div>
               {imgRefreshMsg && (
                 <p className="text-xs text-zinc-500">{imgRefreshMsg}</p>
               )}
@@ -319,8 +438,51 @@ export default function Item() {
             {/* Identity */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
               <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-white font-semibold text-lg leading-tight">{item.name}</p>
+                <div className="flex-1 min-w-0">
+                  {editingName ? (
+                    <div>
+                      <input
+                        ref={nameInputRef}
+                        value={nameInput}
+                        onChange={e => setNameInput(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') handleSaveName();
+                          if (e.key === 'Escape') setEditingName(false);
+                        }}
+                        maxLength={200}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-white text-base font-semibold focus:outline-none focus:border-indigo-500"
+                      />
+                      <div className="flex gap-2 mt-2">
+                        <button
+                          onClick={handleSaveName}
+                          disabled={savingName}
+                          className="text-xs bg-indigo-500 hover:bg-indigo-600 text-white px-3 py-1 rounded-lg transition disabled:opacity-50"
+                        >
+                          {savingName ? 'Saving…' : 'Save'}
+                        </button>
+                        <button
+                          onClick={() => setEditingName(false)}
+                          className="text-xs border border-zinc-700 text-zinc-400 hover:text-zinc-200 px-3 py-1 rounded-lg transition"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-start gap-1.5">
+                      <p className="text-white font-semibold text-lg leading-tight flex-1 min-w-0">{item.name}</p>
+                      <button
+                        onClick={() => { setNameInput(item.name); setEditingName(true); }}
+                        className="shrink-0 text-zinc-600 hover:text-zinc-400 transition mt-0.5"
+                        title="Rename card"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
                   {item.set_name && <p className="text-zinc-400 text-sm mt-0.5">{item.set_name}</p>}
                 </div>
                 {gradeLabel && (
@@ -605,6 +767,17 @@ export default function Item() {
           </div>
         </div>
       </main>
+
+      {/* Name-update toast */}
+      {nameToast && (
+        <div className={`fixed bottom-5 right-5 z-50 flex items-center gap-2 px-4 py-3 rounded-xl border text-sm shadow-2xl ${
+          nameToast.type === 'ok'
+            ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300'
+            : 'bg-red-500/20 border-red-500/30 text-red-300'
+        }`}>
+          {nameToast.text}
+        </div>
+      )}
 
       {/* Edit modal */}
       {editOpen && (
