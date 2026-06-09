@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS portfolio_items (
   current_value NUMERIC(10,2),
   active_low NUMERIC(10,2),
   forecast_30d NUMERIC(10,2),
-  ximilar_identified BOOLEAN DEFAULT false,
+  scan_identified BOOLEAN DEFAULT false,
   added_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS price_history (
   grade TEXT,
   sold_median NUMERIC(10,2),
   active_low NUMERIC(10,2),
-  source TEXT CHECK (source IN ('ebay','ximilar','mock')),
+  source TEXT CHECK (source IN ('ebay','mock','manual','pricecharting')),
   recorded_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS scan_logs (
 const alterations = `
 DO $$
 BEGIN
-  -- Rename ximilar_identified → scan_identified
+  -- Historical migration: early deployments created this column under a
+  -- scan-provider-specific name; rename it on DBs that still have it.
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_name = 'portfolio_items' AND column_name = 'ximilar_identified'
@@ -100,12 +101,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS master_catalog_ebay_item_id_idx
   ON master_catalog(ebay_item_id)
   WHERE ebay_item_id IS NOT NULL;
 
--- Expand price_history source constraint to include 'manual'
+-- Valid price sources: pricecharting (market value / sold median),
+-- ebay (active-listing floor), manual (owner estimates), mock (seeded data).
+-- Legacy 'ximilar' rows (never an integrated price source) become 'mock'
+-- so the tightened constraint can apply.
+UPDATE price_history SET source = 'mock' WHERE source = 'ximilar';
 DO $$
 BEGIN
   ALTER TABLE price_history DROP CONSTRAINT IF EXISTS price_history_source_check;
   ALTER TABLE price_history ADD CONSTRAINT price_history_source_check
-    CHECK (source IN ('ebay','ximilar','mock','manual','pricecharting'));
+    CHECK (source IN ('ebay','mock','manual','pricecharting'));
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 

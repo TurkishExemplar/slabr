@@ -126,7 +126,9 @@ router.get('/:username', async (req, res) => {
          SELECT sold_median, source
          FROM price_history
          WHERE catalog_id = pi.catalog_id
-         ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'ebay' THEN 2 WHEN 'ximilar' THEN 3 ELSE 4 END,
+           AND sold_median IS NOT NULL
+           AND source <> 'ebay'
+         ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
                   recorded_at DESC
          LIMIT 1
        ) ph ON true

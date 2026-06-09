@@ -123,26 +123,6 @@ function buildQuery(item) {
   }
 }
 
-// Sold-price fallback query.
-// For GRADED items we keep card_number + grade/company even in the loose query so
-// we never fall back to a different card's price. "Loose" here only means we drop
-// set_name (which eBay sellers sometimes omit) but keep the distinguishing fields.
-function buildSoldQuery(item) {
-  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade, rarity } = item;
-  const gradeStr  = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
-  const rookieTag = rarity && /\brookie\b/i.test(rarity) ? 'Rookie' : '';
-
-  switch (item_type) {
-    // card_number kept here (dropped set_name) so "Stephen Curry 2009 321 PSA 9"
-    // can't match cheaper Curry PSA 9 cards from Topps Chrome / Finest / etc.
-    case 'sports_card': return [name, year, card_number, rookieTag, gradeStr].filter(Boolean).join(' ');
-    case 'tcg':         return [name, gradeStr].filter(Boolean).join(' ');
-    case 'comic':       return [name, brand_publisher, gradeStr].filter(Boolean).join(' ');
-    case 'sealed':      return [name, year, sport_game, 'sealed'].filter(Boolean).join(' ');
-    default:            return [name, year, gradeStr].filter(Boolean).join(' ');
-  }
-}
-
 // ── Grade-aware result filters ────────────────────────────────────────────────
 
 // Keep only items whose title includes "<COMPANY> <GRADE>" (e.g. "PSA 9").
@@ -252,92 +232,11 @@ async function fetchCardImage(item) {
   }
 }
 
-// Trim 10 % from each end, return median
-function computeMedian(prices) {
-  if (!prices.length) return null;
-  const sorted = [...prices].sort((a, b) => a - b);
-  const cut    = Math.floor(sorted.length * 0.1);
-  const list   = cut > 0 ? sorted.slice(cut, sorted.length - cut) : sorted;
-  return list[Math.floor(list.length / 2)];
-}
-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── eBay fetch helpers ────────────────────────────────────────────────────────
-
-// Fetch prices for sold-median calculation.
-//
-// Strategy:
-//   1. Try eBay Marketplace Insights API (real sold data).
-//      Requires buy.marketplace.insights scope — needs explicit eBay approval.
-//      If 0 results with specific query, retry with a looser query (no grade).
-//   2. If scope isn't approved (403 / invalid_scope), fall back to Browse API
-//      active-listing prices as a market proxy so the chart is never empty.
-//
-// gradeFilter: { company: 'PSA', grade: '9' } — applied as a title check on
-// every result set so raw copies never contaminate the price sample.
-async function fetchMarketPrices(specificKeywords, looseKeywords, gradeFilter = null) {
-  // ── Attempt 1: Marketplace Insights (real sold data) ──────────────────────
-  try {
-    console.log(`[ebay] Sold query (specific): "${specificKeywords}"${gradeFilter ? ` [grade filter: ${gradeFilter.company} ${gradeFilter.grade}]` : ''}`);
-    const data = await ebayGet('/buy/marketplace_insights/v1_beta/item_sales/search', {
-      q:     specificKeywords,
-      limit: 15,
-      sort:  'newlyListed',
-    });
-    let prices = filterByGradeTag(data.itemSales ?? [], gradeFilter)
-      .map(i => parseFloat(i.lastSoldPrice?.value))
-      .filter(v => !isNaN(v) && v > 0);
-    console.log(`[ebay] Sold results (specific): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
-
-    // Retry with loose query when specific returns nothing
-    if (prices.length === 0 && looseKeywords && looseKeywords !== specificKeywords) {
-      console.log(`[ebay] Sold query (loose): "${looseKeywords}"`);
-      const data2 = await ebayGet('/buy/marketplace_insights/v1_beta/item_sales/search', {
-        q:     looseKeywords,
-        limit: 15,
-        sort:  'newlyListed',
-      });
-      prices = filterByGradeTag(data2.itemSales ?? [], gradeFilter)
-        .map(i => parseFloat(i.lastSoldPrice?.value))
-        .filter(v => !isNaN(v) && v > 0);
-      console.log(`[ebay] Sold results (loose): ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
-    }
-
-    if (prices.length > 0) return prices;
-    // Fall through to Browse API fallback
-    console.log(`[ebay] Sold: 0 results from Marketplace Insights — using Browse API active prices as proxy`);
-  } catch (err) {
-    if (err.message?.includes('invalid_scope') || err.message?.includes('403')) {
-      console.log(`[ebay] Marketplace Insights scope not approved (buy.marketplace.insights requires eBay approval) — using Browse API active prices as proxy`);
-    } else {
-      console.error(`[ebay] Sold prices error: ${err.message} — falling back to Browse API`);
-    }
-  }
-
-  // ── Fallback: Browse API active-listing median ────────────────────────────
-  // Uses active fixed-price listings as a market-value proxy.
-  // Not as accurate as sold data but ensures sold_median is never null.
-  // gradeFilter applied here too so a PSA 9 never gets priced from raw listings.
-  try {
-    const q = looseKeywords || specificKeywords;
-    console.log(`[ebay] Active-price fallback query: "${q}"`);
-    const data = await ebayGet('/buy/browse/v1/item_summary/search', {
-      q:      q,
-      limit:  10,
-      sort:   'price',
-      filter: 'buyingOptions:{FIXED_PRICE}',
-    });
-    const prices = filterByGradeTag(data.itemSummaries ?? [], gradeFilter)
-      .map(i => parseFloat(i.price?.value))
-      .filter(v => !isNaN(v) && v > 0);
-    console.log(`[ebay] Active fallback results: ${prices.length}${prices.length ? ', median: $' + computeMedian(prices) : ''}`);
-    return prices;
-  } catch (err2) {
-    console.error(`[ebay] Active-price fallback failed: ${err2.message}`);
-    return [];
-  }
-}
+// eBay is an active-listing source only — market value (sold median) comes
+// exclusively from PriceCharting.
 
 // Active low (Fixed Price) via Browse API.
 // Returns { activeLow, imageUrl } — imageUrl is used to replace a temporary
@@ -349,7 +248,11 @@ async function fetchMarketPrices(specificKeywords, looseKeywords, gradeFilter = 
 async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
   const data = await ebayGet('/buy/browse/v1/item_summary/search', {
     q:      keywords,
-    limit:  10,          // fetch more so we have a good pool after title filtering
+    // 25-deep pool: with sort=price the cheapest results are often raw cards
+    // that the graded-title filter rejects — a shallow pool can miss every
+    // slab listing and return null even when slabs exist (matches the pool
+    // depth used by fetchActiveListings).
+    limit:  25,
     sort:   'price',
     filter: 'buyingOptions:{FIXED_PRICE}',
   });
@@ -368,6 +271,51 @@ async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
     // Prefer an image from a listing that names the card/player to avoid
     // showing a pack, wrapper, or completely unrelated item.
     imageUrl:  pickBestImage(items.length ? items : raw, itemName),
+  };
+}
+
+// Junk filter for display listings — lighter than JUNK_IMAGE_RE because card
+// titles legitimately contain words like "set" ("Base Set") and "box" is fine
+// for sealed items.  Blocks multi-card lots and fakes only.
+const LISTING_JUNK_RE = /\b(lot|bundle|reseal|resealed|proxy|digital|custom|reprint)\b/i;
+
+// ── Active eBay listings for the item detail page ─────────────────────────────
+// Returns up to `limit` live fixed-price listings mapped for display:
+//   { title, price, currency, condition, seller, url, image }
+// plus the search query used (for a "view all on eBay" link).
+//
+// Graded items are title-filtered to the matching company + grade + card number
+// so a raw copy never shows under a PSA 9 slab's listings.  Sorted by price
+// ascending (eBay sort=price), so the first card is the cheapest.
+async function fetchActiveListings(item, limit = 8) {
+  const keywords    = buildQuery(item);
+  const gradeFilter = item.condition === 'graded' && item.grading_company
+    ? { company: item.grading_company, grade: item.grade, cardNumber: item.card_number }
+    : null;
+
+  const data = await ebayGet('/buy/browse/v1/item_summary/search', {
+    q:      keywords,
+    limit:  25,          // wide pool — title filtering below cuts it down
+    sort:   'price',
+    filter: 'buyingOptions:{FIXED_PRICE}',
+  });
+
+  const raw      = data.itemSummaries ?? [];
+  const filtered = filterByGradeTag(raw, gradeFilter)
+    .filter(l => item.item_type === 'sealed' || !LISTING_JUNK_RE.test(l.title ?? ''))
+    .filter(l => parseFloat(l.price?.value) > 0);
+
+  return {
+    search_query: keywords,
+    listings: filtered.slice(0, limit).map(l => ({
+      title:     l.title ?? '',
+      price:     parseFloat(l.price.value),
+      currency:  l.price?.currency ?? 'USD',
+      condition: l.condition ?? null,
+      seller:    l.seller?.username ?? null,
+      url:       l.itemWebUrl ?? null,
+      image:     l.image?.imageUrl ?? l.thumbnailImages?.[0]?.imageUrl ?? null,
+    })),
   };
 }
 
@@ -449,7 +397,6 @@ async function _runEbayJobInner(hasEbay) {
   for (const combo of combos) {
     try {
       const keywords      = buildQuery(combo);
-      const soldKeywords  = buildSoldQuery(combo);
       const isOneOfOne    = combo.is_one_of_one === true;
       // Grade filter: graded results must have company+grade+card_number in the title
       // so cheaper same-player cards from other sets can't dilute the price sample.
@@ -457,23 +404,15 @@ async function _runEbayJobInner(hasEbay) {
         ? { company: combo.grading_company, grade: combo.grade, cardNumber: combo.card_number }
         : null;
 
-      let soldMedian  = null;
-      let activeLow   = null;
-      let priceSource = 'ebay';
+      let soldMedian = null;
+      let activeLow  = null;
 
-      // Market prices (skip for 1/1)
+      // Market value (skip for 1/1) — PriceCharting only; eBay is an
+      // active-listing source, not a sold-price source.
       if (!isOneOfOne) {
-        // 1. Try PriceCharting first — curated database, cleaner sold prices.
         soldMedian = await fetchPriceCharting(combo);
         if (soldMedian != null) {
-          priceSource = 'pricecharting';
-          console.log(`[ebay-job] ${combo.name} | PriceCharting price: $${soldMedian}`);
-        } else if (hasEbay) {
-          // 2. Fall back to eBay sold / active-listing proxy.
-          const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
-          soldMedian   = computeMedian(prices);
-          console.log(`[ebay-job] ${combo.name} | eBay median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
-          await sleep(400);
+          console.log(`[ebay-job] ${combo.name} | PriceCharting market value: $${soldMedian}`);
         }
       } else {
         skippedOneOfOne++;
@@ -486,12 +425,19 @@ async function _runEbayJobInner(hasEbay) {
         await sleep(400);
       }
 
-      // Write price_history row
-      if (soldMedian != null || activeLow != null) {
+      // Write price_history rows — one per source so `source` stays
+      // unambiguous: pricecharting = market value, ebay = active-listing floor.
+      if (soldMedian != null) {
         await pool.query(`
           INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
-          VALUES ($1, $2, $3, $4, $5, $6)
-        `, [combo.catalog_id, combo.condition, combo.grade, soldMedian, activeLow, priceSource]);
+          VALUES ($1, $2, $3, $4, NULL, 'pricecharting')
+        `, [combo.catalog_id, combo.condition, combo.grade, soldMedian]);
+      }
+      if (activeLow != null) {
+        await pool.query(`
+          INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
+          VALUES ($1, $2, $3, NULL, $4, 'ebay')
+        `, [combo.catalog_id, combo.condition, combo.grade, activeLow]);
       }
 
       // Update portfolio_items
@@ -957,32 +903,25 @@ async function priceSingleItem(catalogId, condition, grade) {
 
   const catalogRow   = { ...rows[0], condition, grade };
   const keywords     = buildQuery(catalogRow);
-  const soldKeywords = buildSoldQuery(catalogRow);
   const isOneOfOne   = catalogRow.is_one_of_one === true;
-  // Grade filter: ensures sold and active searches match graded slabs with the
+  // Grade filter: ensures active-listing searches match graded slabs with the
   // correct card number — prevents cheaper same-player same-grade cards from
   // other sets diluting the price (e.g. Topps Chrome #321 vs base Topps #321).
   const gradeFilter  = condition === 'graded' && catalogRow.grading_company
     ? { company: catalogRow.grading_company, grade, cardNumber: catalogRow.card_number }
     : null;
 
-  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active: "${keywords}" | sold: "${soldKeywords}"${gradeFilter ? ` | grade filter: ${gradeFilter.company} ${gradeFilter.grade}` : ''}`);
+  console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active: "${keywords}"${gradeFilter ? ` | grade filter: ${gradeFilter.company} ${gradeFilter.grade}` : ''}`);
 
-  let soldMedian  = null;
-  let activeLow   = null;
-  let priceSource = 'ebay';
+  let soldMedian = null;
+  let activeLow  = null;
 
   if (!isOneOfOne) {
-    // 1. Try PriceCharting first — curated database with cleaner price data.
+    // Market value (sold median) comes from PriceCharting only — eBay is an
+    // active-listing source, not a sold-price source.
     soldMedian = await fetchPriceCharting(catalogRow);
     if (soldMedian != null) {
-      priceSource = 'pricecharting';
-      console.log(`[pricing] PriceCharting sold price: $${soldMedian}`);
-    } else if (hasEbay) {
-      // 2. Fall back to eBay sold/active data when PriceCharting has no match.
-      const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
-      soldMedian   = computeMedian(prices);
-      console.log(`[pricing] eBay fallback median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
+      console.log(`[pricing] PriceCharting market value: $${soldMedian}`);
     }
   }
 
@@ -1007,11 +946,22 @@ async function priceSingleItem(catalogId, condition, grade) {
   }
 
   if (soldMedian != null || activeLow != null) {
-    await pool.query(`
-      INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
-      VALUES ($1, $2, $3, $4, $5, $6)
-    `, [catalogId, condition, grade, soldMedian, activeLow, priceSource]);
-    console.log(`[pricing] price_history inserted — catalog_id=${catalogId}, source=${priceSource}, sold_median=${soldMedian != null ? '$'+soldMedian : 'null'}, active_low=${activeLow != null ? '$'+activeLow : 'null'}`);
+    // One row per source: pricecharting rows carry the market value
+    // (sold_median) only; ebay rows carry the active-listing floor
+    // (active_low) only.  Keeps `source` unambiguous per row.
+    if (soldMedian != null) {
+      await pool.query(`
+        INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
+        VALUES ($1, $2, $3, $4, NULL, 'pricecharting')
+      `, [catalogId, condition, grade, soldMedian]);
+    }
+    if (activeLow != null) {
+      await pool.query(`
+        INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
+        VALUES ($1, $2, $3, NULL, $4, 'ebay')
+      `, [catalogId, condition, grade, activeLow]);
+    }
+    console.log(`[pricing] price_history inserted — catalog_id=${catalogId}, sold_median=${soldMedian != null ? '$'+soldMedian+' (pricecharting)' : 'null'}, active_low=${activeLow != null ? '$'+activeLow+' (ebay)' : 'null'}`);
 
     if (!isOneOfOne) {
       await pool.query(`
@@ -1038,6 +988,6 @@ async function priceSingleItem(catalogId, condition, grade) {
 }
 
 module.exports = {
-  runEbayJob, ebaySearch, priceSingleItem, fetchCardImage,
-  fetchPriceCharting, scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
+  runEbayJob, ebaySearch, priceSingleItem, fetchCardImage, fetchActiveListings,
+  buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, PC_BASES, PC_JUNK_CONSOLE_RE,
 };

@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db');
+const { fetchActiveListings, buildQuery } = require('../jobs/ebay');
 
 const router = express.Router();
 
@@ -17,13 +18,19 @@ const ITEM_SELECT = `
   ph.recorded_at  AS price_updated_at
 `;
 
+// Latest market-value row.  Market value (sold_median) comes from
+// PriceCharting; 'manual' covers 1/1 owner estimates and 'mock' is seeded
+// placeholder data.  eBay rows are excluded — eBay is an active-listing
+// source (active_low), never a market-value source.
 const PRICE_JOIN = `
   LEFT JOIN LATERAL (
     SELECT sold_median, source, recorded_at
     FROM price_history
     WHERE catalog_id = pi.catalog_id
+      AND sold_median IS NOT NULL
+      AND source <> 'ebay'
     ORDER BY
-      CASE source WHEN 'pricecharting' THEN 1 WHEN 'ebay' THEN 2 WHEN 'ximilar' THEN 3 ELSE 4 END,
+      CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
       recorded_at DESC
     LIMIT 1
   ) ph ON true
@@ -50,19 +57,31 @@ router.get('/', async (req, res) => {
 // GET /api/portfolio/history  — must be before /:id
 router.get('/history', async (req, res) => {
   try {
+    // One row per (portfolio item, day): when a day has rows from multiple
+    // sources (e.g. a seeded mock row plus a real pricecharting row), only the
+    // highest-ranked source counts — pricecharting > manual > ebay > mock —
+    // so the daily total never double-counts an item.
     const { rows } = await pool.query(`
-      SELECT
-        date_trunc('day', ph.recorded_at)::date::text AS date,
-        -- Use active_low as fallback when sold_median is null (e.g. Marketplace
-        -- Insights scope not approved — priceSingleItem still inserts a row but
-        -- only active_low is populated).
-        ROUND(SUM(COALESCE(ph.sold_median, ph.active_low) * pi.quantity)::numeric, 2) AS total_value
-      FROM price_history ph
-      JOIN portfolio_items pi
-        ON ph.catalog_id = pi.catalog_id AND pi.user_id = $1
-      WHERE COALESCE(ph.sold_median, ph.active_low) IS NOT NULL
-      GROUP BY 1
-      ORDER BY 1
+      SELECT date, ROUND(SUM(value * quantity)::numeric, 2) AS total_value
+      FROM (
+        SELECT DISTINCT ON (pi.id, date_trunc('day', ph.recorded_at))
+          pi.id,
+          pi.quantity,
+          date_trunc('day', ph.recorded_at)::date::text AS date,
+          -- ebay rows carry active_low only; all other sources carry sold_median
+          COALESCE(ph.sold_median, ph.active_low) AS value
+        FROM price_history ph
+        JOIN portfolio_items pi
+          ON ph.catalog_id = pi.catalog_id AND pi.user_id = $1
+        WHERE COALESCE(ph.sold_median, ph.active_low) IS NOT NULL
+        ORDER BY
+          pi.id,
+          date_trunc('day', ph.recorded_at),
+          CASE ph.source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 WHEN 'ebay' THEN 3 ELSE 4 END,
+          ph.recorded_at DESC
+      ) best
+      GROUP BY date
+      ORDER BY date
     `, [req.user.userId]);
     res.json(rows);
   } catch (err) {
@@ -93,7 +112,9 @@ router.post('/', async (req, res) => {
       const priceRes = await pool.query(`
         SELECT sold_median FROM price_history
         WHERE catalog_id = $1
-        ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'ebay' THEN 2 WHEN 'ximilar' THEN 3 ELSE 4 END,
+          AND sold_median IS NOT NULL
+          AND source <> 'ebay'
+        ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 ELSE 3 END,
                  recorded_at DESC
         LIMIT 1
       `, [catalog_id]);
@@ -160,16 +181,26 @@ router.get('/:id', async (req, res) => {
 
     const item = rows[0];
 
+    // One point per day for the chart: when a day has rows from multiple
+    // sources, plot only the highest-ranked one (pricecharting > manual >
+    // ebay > mock) so the line never zig-zags between market value and
+    // active-listing floor.
     const { rows: historyRows } = await pool.query(`
-      SELECT
-        date_trunc('day', recorded_at)::date::text AS date,
-        -- Fall back to active_low when sold_median is null (Browse API fallback path)
-        ROUND(COALESCE(sold_median, active_low)::numeric, 2) AS value,
-        source
-      FROM price_history
-      WHERE catalog_id = $1
-        AND COALESCE(sold_median, active_low) IS NOT NULL
-      ORDER BY recorded_at ASC
+      SELECT date, value, source FROM (
+        SELECT DISTINCT ON (date_trunc('day', recorded_at))
+          date_trunc('day', recorded_at)::date::text AS date,
+          -- ebay rows carry active_low only; all other sources carry sold_median
+          ROUND(COALESCE(sold_median, active_low)::numeric, 2) AS value,
+          source
+        FROM price_history
+        WHERE catalog_id = $1
+          AND COALESCE(sold_median, active_low) IS NOT NULL
+        ORDER BY
+          date_trunc('day', recorded_at),
+          CASE source WHEN 'pricecharting' THEN 1 WHEN 'manual' THEN 2 WHEN 'ebay' THEN 3 ELSE 4 END,
+          recorded_at DESC
+      ) best
+      ORDER BY date ASC
     `, [item.catalog_id]);
 
     // For 1/1 items, include comparable sales
@@ -187,6 +218,41 @@ router.get('/:id', async (req, res) => {
     res.json({ ...item, price_history: historyRows, comparable_sales: comparableSales });
   } catch (err) {
     console.error('[portfolio GET /:id]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/portfolio/:id/listings
+// Live active eBay listings for this item — fetched on demand by the item
+// detail page (after the main item data, so the page renders fast).
+// Returns { configured, listings: [{title, price, condition, seller, url,
+// image}], search_query, ebay_search_url }.
+router.get('/:id/listings', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT pi.condition, pi.grading_company, pi.grade,
+             mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
+             mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity
+      FROM portfolio_items pi
+      JOIN master_catalog mc ON pi.catalog_id = mc.id
+      WHERE pi.id = $1 AND pi.user_id = $2
+    `, [req.params.id, req.user.userId]);
+
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+
+    const item          = rows[0];
+    const searchQuery   = buildQuery(item);
+    const ebaySearchUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(searchQuery)}&LH_BIN=1`;
+
+    const hasEbay = !!(process.env.EBAY_APP_ID ?? '').trim() && !!(process.env.EBAY_CERT_ID ?? '').trim();
+    if (!hasEbay) {
+      return res.json({ configured: false, listings: [], search_query: searchQuery, ebay_search_url: ebaySearchUrl });
+    }
+
+    const { listings } = await fetchActiveListings(item, 8);
+    res.json({ configured: true, listings, search_query: searchQuery, ebay_search_url: ebaySearchUrl });
+  } catch (err) {
+    console.error('[portfolio GET /:id/listings]', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });

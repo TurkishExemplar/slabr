@@ -19,22 +19,27 @@ function fmtDate(str) {
   return new Date(str).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// Market-value attribution — eBay never appears here: it is an
+// active-listing source only, attributed inside the Active Listings section.
 const SOURCE_STYLE = {
-  ebay:          'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-  ximilar:       'bg-blue-500/10 text-blue-400 border-blue-500/20',
-  manual:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
   pricecharting: 'bg-violet-500/10 text-violet-400 border-violet-500/20',
+  manual:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:          'bg-zinc-500/10 text-zinc-500 border-zinc-700',
   none:          'bg-zinc-500/10 text-zinc-600 border-zinc-800',
 };
 const SOURCE_LABEL = {
-  ebay:          'Powered by eBay',
-  ximilar:       'Powered by Ximilar',
+  pricecharting: 'Market value via PriceCharting',
   manual:        'Owner Estimated',
-  pricecharting: 'Powered by PriceCharting',
   mock:          'Mock Data',
   none:          'Not yet priced',
 };
+
+const EBAY_ATTRIBUTION_STYLE = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+
+function truncateTitle(t, max = 60) {
+  if (!t) return '';
+  return t.length > max ? t.slice(0, max - 1).trimEnd() + '…' : t;
+}
 
 const CERT_URL = {
   PSA:     n => `https://www.psacard.com/cert/${n}`,
@@ -72,6 +77,12 @@ export default function Item() {
 
   // Custom image upload
   const [uploadingImg, setUploadingImg]             = useState(false);
+
+  // Live eBay listings — fetched lazily after the main item data so the
+  // page renders fast even when eBay is slow.
+  const [listings, setListings]               = useState([]);
+  const [listingsMeta, setListingsMeta]       = useState(null);
+  const [listingsLoading, setListingsLoading] = useState(true);
 
   // Inline name editing
   const [editingName, setEditingName]               = useState(false);
@@ -111,6 +122,26 @@ export default function Item() {
   useEffect(() => {
     if (editingName) nameInputRef.current?.focus();
   }, [editingName]);
+
+  // Fetch live eBay listings after the main item data has loaded
+  useEffect(() => {
+    if (!item) return;
+    let cancelled = false;
+    setListingsLoading(true);
+    fetch(`${API}/api/portfolio/${id}/listings`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return;
+        setListings(Array.isArray(data.listings) ? data.listings : []);
+        setListingsMeta(data);
+      })
+      .catch(() => { if (!cancelled) setListings([]); })
+      .finally(() => { if (!cancelled) setListingsLoading(false); });
+    return () => { cancelled = true; };
+    // item?.id (not item) — re-running on every item edit would refetch eBay needlessly
+  }, [item?.id, id, token]);
 
   const chartData = useMemo(() => {
     if (!priceHistory.length) return [];
@@ -640,7 +671,7 @@ export default function Item() {
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3">
               <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Pricing</p>
 
-              {/* Sold Median — hidden for 1/1, replaced with note */}
+              {/* Market Value — hidden for 1/1, replaced with note */}
               {isOneOfOne ? (
                 <div className="flex items-center justify-between">
                   <span className="text-zinc-500 text-sm italic">No sold comps — this is a 1 of 1</span>
@@ -648,48 +679,14 @@ export default function Item() {
               ) : (
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-zinc-500 text-sm">Sold Median</span>
-                    {src === 'ebay' && <p className="text-zinc-600 text-xs">Sold on eBay</p>}
+                    <span className="text-zinc-500 text-sm">Market Value</span>
+                    <p className="text-zinc-600 text-xs">
+                      {src === 'pricecharting' ? 'Sold median' : 'Updates daily'}
+                    </p>
                   </div>
                   <span className="text-zinc-300 text-sm font-medium">
                     {item.ph_value != null ? fmt$(item.ph_value) : '—'}
                   </span>
-                </div>
-              )}
-
-              {/* Active Listings — always shown */}
-              <div className="flex items-center justify-between">
-                <div>
-                  <span className="text-zinc-500 text-sm">Active Listings</span>
-                  <p className="text-zinc-600 text-xs">
-                    {item.active_low != null ? 'Lowest fixed-price on eBay' : 'Updates daily'}
-                  </p>
-                </div>
-                <span className="text-zinc-300 text-sm font-medium">
-                  {item.active_low != null ? fmt$(item.active_low) : '—'}
-                </span>
-              </div>
-
-              {/* No eBay data found — offer manual eBay search */}
-              {!isOneOfOne && item.ph_value == null && item.active_low == null && (
-                <div className="flex items-center justify-between gap-3 py-1">
-                  <p className="text-zinc-600 text-sm">No eBay listings found for this card</p>
-                  <a
-                    href={`https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(
-                      [
-                        item.name,
-                        item.year,
-                        item.grade
-                          ? `${item.grading_company ?? ''} ${item.grade}`.trim()
-                          : null,
-                      ].filter(Boolean).join(' ')
-                    )}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="shrink-0 text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-500/30 hover:border-indigo-500/50 px-3 py-1.5 rounded-lg transition whitespace-nowrap"
-                  >
-                    Search eBay ↗
-                  </a>
                 </div>
               )}
 
@@ -716,6 +713,98 @@ export default function Item() {
                   <span className="text-zinc-600 text-xs">Updated {fmtDate(item.price_updated_at)}</span>
                 )}
               </div>
+            </div>
+
+            {/* Active eBay Listings */}
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Active Listings</p>
+                <span className={`text-[10px] border px-2 py-0.5 rounded-full ${EBAY_ATTRIBUTION_STYLE}`}>
+                  Active listings via eBay
+                </span>
+              </div>
+
+              {listingsLoading ? (
+                <div className="space-y-3">
+                  {[0, 1, 2].map(i => (
+                    <div key={i} className="flex items-center gap-3 animate-pulse">
+                      <div className="w-12 h-12 rounded-lg bg-zinc-800 shrink-0" />
+                      <div className="flex-1 space-y-2">
+                        <div className="h-3 bg-zinc-800 rounded w-3/4" />
+                        <div className="h-3 bg-zinc-800 rounded w-1/3" />
+                      </div>
+                      <div className="h-5 w-16 bg-zinc-800 rounded" />
+                    </div>
+                  ))}
+                </div>
+              ) : listings.length === 0 ? (
+                <div className="text-center py-6">
+                  <p className="text-zinc-600 text-sm">No active listings found on eBay</p>
+                  {listingsMeta?.ebay_search_url && (
+                    <a
+                      href={listingsMeta.ebay_search_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-block mt-3 text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-500/30 hover:border-indigo-500/50 px-3 py-1.5 rounded-lg transition"
+                    >
+                      Search eBay ↗
+                    </a>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-2.5">
+                    {listings.map((l, i) => (
+                      <div key={i} className="flex items-center gap-3 bg-zinc-950/60 border border-zinc-800 rounded-xl p-3">
+                        <div className="w-12 h-12 rounded-lg bg-zinc-800 overflow-hidden shrink-0 flex items-center justify-center">
+                          {l.image ? (
+                            <img src={l.image} alt="" className="w-full h-full object-cover" loading="lazy" />
+                          ) : (
+                            <svg className="w-5 h-5 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                                d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-zinc-300 text-xs leading-snug">{truncateTitle(l.title)}</p>
+                          <div className="flex items-center gap-2 mt-1">
+                            {l.condition && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">
+                                {l.condition}
+                              </span>
+                            )}
+                            {l.seller && <span className="text-[10px] text-zinc-600 truncate">{l.seller}</span>}
+                          </div>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <p className="text-white text-base font-semibold">{fmt$(l.price)}</p>
+                          {l.url && (
+                            <a
+                              href={l.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-[11px] text-indigo-400 hover:text-indigo-300 transition whitespace-nowrap"
+                            >
+                              View on eBay ↗
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {listingsMeta?.ebay_search_url && (
+                    <a
+                      href={listingsMeta.ebay_search_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="block text-center mt-4 text-xs text-indigo-400 hover:text-indigo-300 transition"
+                    >
+                      View all on eBay ↗
+                    </a>
+                  )}
+                </>
+              )}
             </div>
 
             {/* Comparable Parallel Sales — 1/1 only */}
