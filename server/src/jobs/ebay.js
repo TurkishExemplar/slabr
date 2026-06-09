@@ -439,20 +439,29 @@ async function runEbayJob() {
         ? { company: combo.grading_company, grade: combo.grade, cardNumber: combo.card_number }
         : null;
 
-      let soldMedian = null;
-      let activeLow  = null;
+      let soldMedian  = null;
+      let activeLow   = null;
+      let priceSource = 'ebay';
 
       // Market prices (skip for 1/1)
       if (!isOneOfOne) {
-        const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
-        soldMedian   = computeMedian(prices);
-        console.log(`[ebay-job] ${combo.name} | sold/proxy median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
-        await sleep(400);
+        // 1. Try PriceCharting first — curated database, cleaner sold prices.
+        soldMedian = await fetchPriceCharting(combo);
+        if (soldMedian != null) {
+          priceSource = 'pricecharting';
+          console.log(`[ebay-job] ${combo.name} | PriceCharting price: $${soldMedian}`);
+        } else {
+          // 2. Fall back to eBay sold / active-listing proxy.
+          const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
+          soldMedian   = computeMedian(prices);
+          console.log(`[ebay-job] ${combo.name} | eBay median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
+          await sleep(400);
+        }
       } else {
         skippedOneOfOne++;
       }
 
-      // Active low (imageUrl unused in bulk job — priceSingleItem handles image updates)
+      // Active low is always sourced from eBay active listings
       ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name));
       console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
       await sleep(400);
@@ -461,8 +470,8 @@ async function runEbayJob() {
       if (soldMedian != null || activeLow != null) {
         await pool.query(`
           INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
-          VALUES ($1, $2, $3, $4, $5, 'ebay')
-        `, [combo.catalog_id, combo.condition, combo.grade, soldMedian, activeLow]);
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [combo.catalog_id, combo.condition, combo.grade, soldMedian, activeLow, priceSource]);
       }
 
       // Update portfolio_items
@@ -727,6 +736,76 @@ async function ebaySearch(query, limit = 25) {
   return clean;
 }
 
+// ── PriceCharting price lookup ────────────────────────────────────────────────
+//
+// PriceCharting is a curated collectibles price database — more reliable
+// than eBay raw listing data for clean sold-price medians.
+//
+// Endpoint : GET https://www.pricecharting.com/api/product?t=TOKEN&q=...
+// Auth     : ?t=PRICE_CHARTING_TOKEN on every request
+// Prices   : all values are in CENTS (pennies) — divide by 100 for dollars.
+//            PriceCharting stores 0 for "no price recorded"; treat as missing.
+//
+// Price-field selection:
+//   graded items → graded-price  (structured-grade price, e.g. PSA 8 equivalent)
+//                  → cib-price   (near-mint / complete-in-box) as fallback
+//   raw / ungraded → loose-price (played/raw value)
+//                   → cib-price  (near-mint) as fallback
+//
+// Returns a price in dollars (number) or null when no usable price was found.
+async function fetchPriceCharting(item) {
+  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  if (!token) return null;
+
+  const { name, year, set_name, condition } = item;
+  // Build query from name + year + set — mirrors the example in the integration spec.
+  const q = [name, year, set_name].filter(Boolean).join(' ');
+
+  try {
+    const url = `https://www.pricecharting.com/api/product?t=${encodeURIComponent(token)}&q=${encodeURIComponent(q)}`;
+    console.log(`[pricecharting] Searching: "${q}" (condition=${condition ?? 'raw'})`);
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) {
+      console.warn(`[pricecharting] HTTP ${res.status} for "${q}"`);
+      return null;
+    }
+
+    const data = await res.json();
+    if (data.status !== 'success' || !Array.isArray(data.products) || !data.products.length) {
+      console.log(`[pricecharting] No results for "${q}"`);
+      return null;
+    }
+
+    // First result is PriceCharting's best relevance match.
+    const product = data.products[0];
+
+    // Select the price field appropriate for the item's condition.
+    // Null-coalesce: use the first field that has a positive value.
+    let cents = null;
+    if (condition === 'graded') {
+      cents = (product['graded-price'] > 0 ? product['graded-price'] : null)
+           ?? (product['cib-price']    > 0 ? product['cib-price']    : null);
+    } else {
+      cents = (product['loose-price'] > 0 ? product['loose-price'] : null)
+           ?? (product['cib-price']   > 0 ? product['cib-price']   : null);
+    }
+
+    if (cents == null) {
+      console.log(`[pricecharting] "${product['product-name']}" — no usable price (all fields zero or absent)`);
+      return null;
+    }
+
+    const price = parseFloat((cents / 100).toFixed(2));
+    console.log(`[pricecharting] "${product['product-name']}" — $${price} (${cents} cents, ${condition === 'graded' ? 'graded-price' : 'loose-price'} field)`);
+    return price;
+
+  } catch (err) {
+    console.error(`[pricecharting] Error for "${q}": ${err.message}`);
+    return null;
+  }
+}
+
 // ── Instant single-item pricer (called right after a portfolio add) ───────────
 //
 // Fetches eBay prices for one (catalogId, condition, grade) combo,
@@ -735,9 +814,13 @@ async function ebaySearch(query, limit = 25) {
 // out first.
 
 async function priceSingleItem(catalogId, condition, grade) {
-  const appId  = (process.env.EBAY_APP_ID  ?? '').trim();
-  const certId = (process.env.EBAY_CERT_ID ?? '').trim();
-  if (!appId || !certId) return null;
+  const appId   = (process.env.EBAY_APP_ID  ?? '').trim();
+  const certId  = (process.env.EBAY_CERT_ID ?? '').trim();
+  const pcToken = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  const hasEbay = !!(appId && certId);
+
+  // Need at least one pricing source to proceed
+  if (!pcToken && !hasEbay) return null;
 
   // Grab the catalog metadata + grading company from the matching portfolio row
   const { rows } = await pool.query(`
@@ -768,37 +851,50 @@ async function priceSingleItem(catalogId, condition, grade) {
 
   console.log(`[pricing] Auto-pricing "${catalogRow.name}" — active: "${keywords}" | sold: "${soldKeywords}"${gradeFilter ? ` | grade filter: ${gradeFilter.company} ${gradeFilter.grade}` : ''}`);
 
-  let soldMedian = null;
-  let activeLow  = null;
+  let soldMedian  = null;
+  let activeLow   = null;
+  let priceSource = 'ebay';
 
   if (!isOneOfOne) {
-    const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
-    soldMedian   = computeMedian(prices);
+    // 1. Try PriceCharting first — curated database with cleaner price data.
+    soldMedian = await fetchPriceCharting(catalogRow);
+    if (soldMedian != null) {
+      priceSource = 'pricecharting';
+      console.log(`[pricing] PriceCharting sold price: $${soldMedian}`);
+    } else if (hasEbay) {
+      // 2. Fall back to eBay sold/active data when PriceCharting has no match.
+      const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
+      soldMedian   = computeMedian(prices);
+      console.log(`[pricing] eBay fallback median: ${soldMedian != null ? '$' + soldMedian : '—'}`);
+    }
   }
 
-  const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
-  activeLow = activeResult.activeLow;
+  // Active listings and card image are always sourced from eBay (when configured).
+  if (hasEbay) {
+    const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
+    activeLow = activeResult.activeLow;
 
-  // Fetch a card image from eBay and store it — but ONLY if the catalog entry
-  // has no image yet.  This preserves user-uploaded scan photos: when someone
-  // scans their physical card the photo they took is saved as a data: URL and
-  // should remain the displayed image.  eBay images are a fallback for items
-  // that have no photo at all (manually added or scan photo was too large to save).
-  const imageUrl = await fetchCardImage(catalogRow);
-  if (imageUrl) {
-    await pool.query(
-      'UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL',
-      [imageUrl, catalogId]
-    );
-    console.log(`[pricing] catalog image set from eBay for catalog_id=${catalogId}`);
+    // Fetch a card image from eBay and store it — but ONLY if the catalog entry
+    // has no image yet.  This preserves user-uploaded scan photos: when someone
+    // scans their physical card the photo they took is saved as a data: URL and
+    // should remain the displayed image.  eBay images are a fallback for items
+    // that have no photo at all (manually added or scan photo was too large to save).
+    const imageUrl = await fetchCardImage(catalogRow);
+    if (imageUrl) {
+      await pool.query(
+        'UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL',
+        [imageUrl, catalogId]
+      );
+      console.log(`[pricing] catalog image set from eBay for catalog_id=${catalogId}`);
+    }
   }
 
   if (soldMedian != null || activeLow != null) {
     await pool.query(`
       INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source)
-      VALUES ($1, $2, $3, $4, $5, 'ebay')
-    `, [catalogId, condition, grade, soldMedian, activeLow]);
-    console.log(`[pricing] price_history row inserted — catalog_id=${catalogId}, sold_median=${soldMedian != null ? '$'+soldMedian : 'null'}, active_low=${activeLow != null ? '$'+activeLow : 'null'}`);
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [catalogId, condition, grade, soldMedian, activeLow, priceSource]);
+    console.log(`[pricing] price_history inserted — catalog_id=${catalogId}, source=${priceSource}, sold_median=${soldMedian != null ? '$'+soldMedian : 'null'}, active_low=${activeLow != null ? '$'+activeLow : 'null'}`);
 
     if (!isOneOfOne) {
       await pool.query(`

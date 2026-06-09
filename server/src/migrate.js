@@ -105,7 +105,7 @@ DO $$
 BEGIN
   ALTER TABLE price_history DROP CONSTRAINT IF EXISTS price_history_source_check;
   ALTER TABLE price_history ADD CONSTRAINT price_history_source_check
-    CHECK (source IN ('ebay','ximilar','mock','manual'));
+    CHECK (source IN ('ebay','ximilar','mock','manual','pricecharting'));
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 

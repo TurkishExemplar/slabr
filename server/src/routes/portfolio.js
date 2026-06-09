@@ -126,8 +126,10 @@ router.post('/', async (req, res) => {
 
     // ── Background instant pricing ────────────────────────────────────────
     // Run after the response is sent so the user isn't blocked.
-    // Only fires when eBay credentials are configured.
-    if ((process.env.EBAY_APP_ID ?? '').trim() && (process.env.EBAY_CERT_ID ?? '').trim()) {
+    // Fires when at least one pricing source (PriceCharting or eBay) is configured.
+    const _hasPc   = !!(process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+    const _hasEbay = !!(process.env.EBAY_APP_ID ?? '').trim() && !!(process.env.EBAY_CERT_ID ?? '').trim();
+    if (_hasPc || _hasEbay) {
       setImmediate(async () => {
         try {
           const { priceSingleItem } = require('../jobs/ebay');
