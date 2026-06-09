@@ -138,15 +138,67 @@ async function start() {
 
     console.log('[startup] Slabr API ready.');
 
-    // ── 6. eBay cron ─────────────────────────────────────────────────────────
-    if ((process.env.EBAY_APP_ID ?? '').trim()) {
+    // ── 6. Daily price cron ──────────────────────────────────────────────────
+    // Runs when at least one pricing source is configured — PriceCharting
+    // and/or eBay (runEbayJob handles either being absent).
+    const hasPriceSource =
+      !!(process.env.PRICE_CHARTING_TOKEN ?? '').trim() ||
+      !!(process.env.EBAY_APP_ID ?? '').trim();
+
+    if (hasPriceSource) {
       cron.schedule('0 3 * * *', () => {
-        console.log('[cron] Running daily eBay price job…');
-        runEbayJob().catch(err => console.error('[cron] eBay job failed:', err.message));
+        console.log('[cron] Running daily price job…');
+        runEbayJob().catch(err => console.error('[cron] price job failed:', err.message));
       });
-      console.log('[startup] eBay price job scheduled (daily at 3:00 AM).');
+      console.log('[startup] Daily price job scheduled (3:00 AM).');
     } else {
-      console.log('[startup] eBay job not scheduled: EBAY_APP_ID not set.');
+      console.log('[startup] Price job not scheduled: no pricing source configured.');
+    }
+
+    // ── 7. One-time PriceCharting backfill ───────────────────────────────────
+    // Existing portfolio items were priced before the PriceCharting integration
+    // shipped, so they carry mock/eBay values.  On the first boot where a PC
+    // token is configured, run one full price refresh in the background to
+    // replace them, then record a marker in app_meta so later deploys skip it.
+    // The daily cron keeps prices fresh from then on.
+    if ((process.env.PRICE_CHARTING_TOKEN ?? '').trim()) {
+      try {
+        const { rows: marker } = await pool.query(
+          "SELECT value FROM app_meta WHERE key = 'pricecharting_backfill_done'"
+        );
+        if (!marker.length) {
+          console.log('[startup] PriceCharting backfill not yet run — starting full price refresh in background…');
+          setImmediate(async () => {
+            try {
+              const result = await runEbayJob();
+
+              // runEbayJob swallows per-item API errors and resolves even when
+              // every PriceCharting lookup failed (bad token, PC outage), so a
+              // resolved promise alone is not evidence the backfill worked.
+              // Only mark done once at least one pricecharting-sourced price
+              // row actually exists; otherwise retry on the next deploy.
+              const { rows: pcRows } = await pool.query(
+                "SELECT 1 FROM price_history WHERE source = 'pricecharting' LIMIT 1"
+              );
+              if (pcRows.length) {
+                await pool.query(`
+                  INSERT INTO app_meta (key, value, updated_at)
+                  VALUES ('pricecharting_backfill_done', $1, NOW())
+                  ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+                `, [JSON.stringify(result)]);
+                console.log('[startup] PriceCharting backfill finished:', JSON.stringify(result));
+              } else {
+                console.warn('[startup] PriceCharting backfill produced no pricecharting rows — marker NOT set, will retry next boot. Result:', JSON.stringify(result));
+              }
+            } catch (err) {
+              // Marker NOT written on failure — next deploy retries.
+              console.error('[startup] PriceCharting backfill failed (will retry next boot):', err.message);
+            }
+          });
+        }
+      } catch (err) {
+        console.error('[startup] PriceCharting backfill check failed:', err.message);
+      }
     }
 
   } catch (err) {

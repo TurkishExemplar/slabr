@@ -23,7 +23,7 @@ const PRICE_JOIN = `
     FROM price_history
     WHERE catalog_id = pi.catalog_id
     ORDER BY
-      CASE source WHEN 'ebay' THEN 1 WHEN 'ximilar' THEN 2 ELSE 3 END,
+      CASE source WHEN 'pricecharting' THEN 1 WHEN 'ebay' THEN 2 WHEN 'ximilar' THEN 3 ELSE 4 END,
       recorded_at DESC
     LIMIT 1
   ) ph ON true
@@ -93,7 +93,7 @@ router.post('/', async (req, res) => {
       const priceRes = await pool.query(`
         SELECT sold_median FROM price_history
         WHERE catalog_id = $1
-        ORDER BY CASE source WHEN 'ebay' THEN 1 WHEN 'ximilar' THEN 2 ELSE 3 END,
+        ORDER BY CASE source WHEN 'pricecharting' THEN 1 WHEN 'ebay' THEN 2 WHEN 'ximilar' THEN 3 ELSE 4 END,
                  recorded_at DESC
         LIMIT 1
       `, [catalog_id]);

@@ -113,6 +113,13 @@ END $$;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;
 
+-- Phase 13: app_meta key-value store (one-time job markers)
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Clear bad CDN image_url values so priceSingleItem / refresh-image can re-fetch.
 -- NOTE: data: URIs are intentionally preserved — they are scan photos uploaded
 -- by the user and should remain until eBay's priceSingleItem replaces them with

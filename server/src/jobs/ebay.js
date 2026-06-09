@@ -393,18 +393,36 @@ async function fetchComparableSale(keywords) {
 
 // ── Main job ──────────────────────────────────────────────────────────────────
 
+// In-process overlap guard — the boot backfill, the 3 AM cron, and the manual
+// admin trigger all live in one process; concurrent runs would insert duplicate
+// price_history rows for the same day.
+let _jobRunning = false;
+
 async function runEbayJob() {
-  const appId  = (process.env.EBAY_APP_ID  ?? '').trim();
-  const certId = (process.env.EBAY_CERT_ID ?? '').trim();
+  const appId   = (process.env.EBAY_APP_ID  ?? '').trim();
+  const certId  = (process.env.EBAY_CERT_ID ?? '').trim();
+  const pcToken = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  const hasEbay = !!(appId && certId);
 
-  if (!appId) {
-    console.log('[ebay-job] Skipped: EBAY_APP_ID not set');
-    return { skipped: true, reason: 'EBAY_APP_ID not set' };
+  if (!hasEbay && !pcToken) {
+    console.log('[ebay-job] Skipped: no pricing source configured (need EBAY_APP_ID+EBAY_CERT_ID or PRICE_CHARTING_TOKEN)');
+    return { skipped: true, reason: 'No pricing source configured' };
   }
+  if (_jobRunning) {
+    console.log('[ebay-job] Skipped: a price job is already running');
+    return { skipped: true, reason: 'Job already running' };
+  }
+  _jobRunning = true;
+  try {
+    return await _runEbayJobInner(hasEbay);
+  } finally {
+    _jobRunning = false;
+  }
+}
 
-  if (!certId) {
-    console.log('[ebay-job] Skipped: EBAY_CERT_ID not set — add it to .env to enable live pricing');
-    return { skipped: true, reason: 'EBAY_CERT_ID not set' };
+async function _runEbayJobInner(hasEbay) {
+  if (!hasEbay) {
+    console.log('[ebay-job] eBay credentials not set — PriceCharting-only run (no active-low / comparable sales)');
   }
 
   console.log('[ebay-job] Starting (Browse API)...');
@@ -450,7 +468,7 @@ async function runEbayJob() {
         if (soldMedian != null) {
           priceSource = 'pricecharting';
           console.log(`[ebay-job] ${combo.name} | PriceCharting price: $${soldMedian}`);
-        } else {
+        } else if (hasEbay) {
           // 2. Fall back to eBay sold / active-listing proxy.
           const prices = await fetchMarketPrices(keywords, soldKeywords, gradeFilter);
           soldMedian   = computeMedian(prices);
@@ -462,9 +480,11 @@ async function runEbayJob() {
       }
 
       // Active low is always sourced from eBay active listings
-      ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name));
-      console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
-      await sleep(400);
+      if (hasEbay) {
+        ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name));
+        console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
+        await sleep(400);
+      }
 
       // Write price_history row
       if (soldMedian != null || activeLow != null) {
@@ -494,8 +514,8 @@ async function runEbayJob() {
         `, [activeLow, combo.catalog_id]);
       }
 
-      // Comparable sales for 1/1 items
-      if (isOneOfOne) {
+      // Comparable sales for 1/1 items (eBay-only feature)
+      if (isOneOfOne && hasEbay) {
         const { rows: oneOfOneItems } = await pool.query(
           `SELECT id FROM portfolio_items WHERE catalog_id = $1 AND is_one_of_one = true`,
           [combo.catalog_id]
