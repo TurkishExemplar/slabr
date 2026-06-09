@@ -20,7 +20,7 @@ const scanLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders:   false,
   keyGenerator:   (req) => String(req.user?.userId ?? req.ip),
-  message: { error: 'Scan rate limit reached — please wait before scanning again.' },
+  message: { error: 'Too many scan requests — please wait before scanning again.' },
 });
 
 // ── Admin limiter — protect job-trigger endpoints ─────────────────────────────

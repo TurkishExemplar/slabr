@@ -60,7 +60,10 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: '10mb' }));
+// 15 MB allows a 10 MB image encoded as base64 (~13.4 MB) plus JSON framing.
+// The /api/scan route enforces its own tighter decoded-size limit (10 MB) so
+// other routes are still effectively bound by the actual payload content check.
+app.use(express.json({ limit: '15mb' }));
 
 // ── Global middleware ─────────────────────────────────────────────────────
 app.use(sanitize);         // trim + null-byte strip on every req.body

@@ -184,6 +184,55 @@ router.post('/', scanLimiter, async (req, res) => {
     return res.status(400).json({ error: 'image_base64 is required' });
   }
 
+  // ── Payload validation (all checks run before any API call) ──────────────
+
+  // Strip data-URI prefix safely — anything before the comma is metadata only.
+  const base64 = image_base64.replace(/^data:[^;]+;base64,/, '');
+
+  // 1. Base64 well-formedness — reject strings with characters outside the
+  //    standard base64 alphabet.  Sample the start and end; checking the full
+  //    multi-megabyte string with a regex would be slow and isn't necessary
+  //    because the magic-byte decode below catches corrupt payloads.
+  if (base64.length < 8 || !/^[A-Za-z0-9+/]/.test(base64)) {
+    return res.status(400).json({ error: 'Only image files are accepted' });
+  }
+
+  // 2. Decoded-size estimate — base64 encodes 3 bytes as 4 chars, so
+  //    decoded_bytes ≈ base64_length × ¾.  Reject before decoding the full
+  //    payload to avoid allocating a huge buffer for oversized uploads.
+  const estimatedBytes = Math.floor((base64.length * 3) / 4);
+  if (estimatedBytes > 10 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Image too large — maximum 10MB' });
+  }
+
+  // 3. Magic-byte validation — check actual file header bytes, not the MIME
+  //    type string claimed by the client (which can be set to anything).
+  //    Decode only the first 16 bytes (24 base64 chars) to keep this fast.
+  //
+  //    Signatures:
+  //      JPEG  FF D8 FF
+  //      PNG   89 50 4E 47 0D 0A 1A 0A
+  //      GIF   47 49 46 38  ("GIF8")
+  //      WebP  52 49 46 46 .. .. .. .. 57 45 42 50  ("RIFF....WEBP")
+  let mediaType;
+  try {
+    const h = Buffer.from(base64.slice(0, 24), 'base64');
+    if (h[0] === 0xFF && h[1] === 0xD8 && h[2] === 0xFF) {
+      mediaType = 'image/jpeg';
+    } else if (h[0] === 0x89 && h[1] === 0x50 && h[2] === 0x4E && h[3] === 0x47) {
+      mediaType = 'image/png';
+    } else if (h[0] === 0x47 && h[1] === 0x49 && h[2] === 0x46) {
+      mediaType = 'image/gif';
+    } else if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46 &&
+               h[8] === 0x57 && h[9] === 0x45 && h[10] === 0x42 && h[11] === 0x50) {
+      mediaType = 'image/webp';
+    } else {
+      return res.status(400).json({ error: 'Only image files are accepted' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Only image files are accepted' });
+  }
+
   // Rate limit: 50 scans per user per 24 hours
   const { rows: rateRows } = await pool.query(
     `SELECT COUNT(*) FROM scan_logs WHERE user_id = $1 AND scanned_at > NOW() - INTERVAL '24 hours'`,
@@ -192,11 +241,6 @@ router.post('/', scanLimiter, async (req, res) => {
   if (parseInt(rateRows[0].count) >= 50) {
     return res.status(429).json({ error: 'Scan limit reached', detail: '50 scans per 24 hours' });
   }
-
-  // Detect media type from data-URI prefix; default to JPEG
-  const mimeMatch = image_base64.match(/^data:([^;]+);base64,/);
-  const mediaType = (mimeMatch?.[1] ?? 'image/jpeg');
-  const base64 = image_base64.replace(/^data:[^;]+;base64,/, '');
 
   try {
     // Lazy init — only constructed when a scan is actually requested,
@@ -239,20 +283,58 @@ router.post('/', scanLimiter, async (req, res) => {
 
     const derivedType = item_type ?? itemTypeFromHint(parsed.item_type);
 
+    // ── Sanitise Claude's returned field values before touching the DB ────────
+    // Parameterised queries block SQL injection, but we also:
+    //   • Strip HTML tags  — prevents stored XSS if values are ever rendered raw
+    //   • Cap string lengths — prevents oversized column inserts from crafted images
+    //   • Range-validate numerics — year and grade must be within expected bounds
+
+    // Strip any HTML/XML tags then trim whitespace
+    const stripHtml = v =>
+      typeof v === 'string' ? v.replace(/<[^>]*>/g, '').trim() : v;
+
+    // Strip HTML, then truncate to max chars
+    const clean = (v, max) => {
+      const s = stripHtml(v);
+      return typeof s === 'string' ? s.slice(0, max) : null;
+    };
+
+    // Year: must be a real integer in [1800, currentYear + 1]
+    const rawYear = typeof parsed.year === 'number' ? Math.round(parsed.year) : null;
+    const safeYear = rawYear != null && rawYear >= 1800 && rawYear <= new Date().getFullYear() + 1
+      ? rawYear : null;
+
+    // Grade: must be a number in [1, 10] — covers PSA/BGS/CGC/SGC scales.
+    // Stored as text (e.g. "9.5") but validated numerically.
+    let safeGrade = null;
+    if (parsed.grade != null) {
+      const g = parseFloat(parsed.grade);
+      if (!isNaN(g) && g >= 1 && g <= 10) {
+        safeGrade = String(parsed.grade).replace(/<[^>]*>/g, '').trim().slice(0, 10);
+      }
+    }
+
+    // Grading company must be one of the known labels
+    const KNOWN_GRADERS = new Set(['PSA', 'BGS', 'CGC', 'SGC']);
+    const safeGrader = KNOWN_GRADERS.has(parsed.grading_company) ? parsed.grading_company : null;
+
+    // Condition must be 'graded' or 'raw'
+    const safeCondition = parsed.condition === 'graded' ? 'graded' : 'raw';
+
     const identified = {
-      name:            parsed.name            ?? null,
-      set_name:        parsed.set_name         ?? null,
-      year:            parsed.year             ?? null,
-      card_number:     parsed.card_number      ?? null,
-      rarity:          parsed.rarity           ?? null,
-      sport_game:      parsed.sport_game       ?? null,
-      condition:       parsed.condition        ?? 'raw',
-      grading_company: parsed.grading_company  ?? null,
-      grade:           parsed.grade            ?? null,
-      cert_number:     parsed.cert_number      ?? null,
+      name:            clean(parsed.name,            200),
+      set_name:        clean(parsed.set_name,        200),
+      year:            safeYear,
+      card_number:     clean(parsed.card_number,      20),
+      rarity:          clean(parsed.rarity,          100),
+      sport_game:      clean(parsed.sport_game,       50),
+      condition:       safeCondition,
+      grading_company: safeGrader,
+      grade:           safeGrade,
+      cert_number:     clean(parsed.cert_number,      40),
       current_value:   null,
       forecast_30d:    null,
-      confidence:      parsed.confidence       ?? 0.5,
+      confidence:      typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
     };
 
     // Pass the scan photo so resolveCatalogId can save it as a temporary
@@ -263,7 +345,9 @@ router.post('/', scanLimiter, async (req, res) => {
 
   } catch (err) {
     console.error('[scan]', err.message);
-    res.status(500).json({ error: 'Scan failed', detail: err.message });
+    // Do not echo err.message to the client — it can contain internal details
+    // (Anthropic API error bodies, paths, credentials fragments).
+    res.status(500).json({ error: 'Scan failed — please try again' });
   }
 });
 
