@@ -30,6 +30,9 @@ const TEST_CARDS = [
   { name: 'LeBron James',  year: 2003, set_name: 'Topps Chrome', card_number: '111', condition: 'graded', grading_company: 'BGS', grade: '9.5' },
   { name: 'Stephen Curry', year: 2009, set_name: 'Topps',        card_number: '321', condition: 'graded', grading_company: 'PSA', grade: '10'  },
   { name: 'Kobe Bryant',   year: 1996, set_name: 'Topps Chrome',                     condition: 'raw' },
+  // Scan-style name (everything stuffed into the name) — regression for the
+  // BGS 8.5 Jordan that matched a junk-wax card and priced at $20
+  { name: 'Michael Jordan 1986-87 Fleer #57', year: 1986, set_name: '1986-87 Fleer', card_number: '57', condition: 'graded', grading_company: 'BGS', grade: '8.5' },
   // Pokemon
   { name: 'Charizard',     year: 1999, set_name: 'Base Set',                         condition: 'raw' },
 ];

@@ -205,8 +205,24 @@ router.get('/test-pricecharting', async (req, res) => {
           continue;
         }
         const scored = candidates
-          .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
+          .map(p => ({ p, score: scorePcProduct(p, year, set_name, card_number) }))
           .sort((a, b) => b.score - a.score);
+
+        // Mirror fetchPriceCharting: reject best matches that corroborate
+        // none of the item's identifying fields (wrong card entirely).
+        if ((year || set_name || card_number) && scored[0].score <= 0) {
+          tried.push({
+            base: host, try: i + 1, query: q, search_url: displaySearch,
+            result: 'low_score_rejected',
+            best_candidate: {
+              product_name: scored[0].p['product-name'],
+              console_name: scored[0].p['console-name'] ?? null,
+              score: scored[0].score,
+            },
+            total_search_results: searchData.products.length,
+          });
+          continue;
+        }
         const best = scored[0].p;
         const productId = best.id;
 

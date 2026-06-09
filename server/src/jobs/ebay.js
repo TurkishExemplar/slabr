@@ -678,10 +678,14 @@ const PC_BASES = [
 // pricecharting.com — never price a card from a figure listing.
 const PC_JUNK_CONSOLE_RE = /\bfunko\b|\bpop!/i;
 
-// Score how well a PriceCharting product's console-name matches our set/year.
-// Higher score = better match; used to rank products when a query returns many.
-function scorePcProduct(product, year, set_name) {
+// Score how well a PriceCharting product matches our item.
+// console-name carries the set/year ("Basketball Cards 1986 Fleer"),
+// product-name carries the card number ("Michael Jordan #57").
+// A WRONG card number is heavily penalized — a junk-wax-era Jordan #29
+// must never price a 1986 Fleer Jordan #57.
+function scorePcProduct(product, year, set_name, card_number) {
   const consoleName = (product['console-name'] ?? '').toLowerCase();
+  const productName = (product['product-name'] ?? '').toLowerCase();
   let score = 0;
   if (year && consoleName.includes(String(year))) score += 3;
   if (set_name) {
@@ -689,6 +693,11 @@ function scorePcProduct(product, year, set_name) {
     for (const part of setParts) {
       if (part.length > 2 && consoleName.includes(part)) score += 2;
     }
+  }
+  if (card_number) {
+    const cn = String(card_number).toLowerCase();
+    const m  = productName.match(/#\s*([a-z0-9-]+)/i);
+    if (m) score += m[1].toLowerCase() === cn ? 4 : -4;
   }
   return score;
 }
@@ -741,27 +750,58 @@ async function pcProductImage(product) {
   return null;
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Scanned cards often arrive with everything stuffed into the name —
+// "Michael Jordan 1986-87 Fleer #57" — which duplicates the structured
+// year/set_name/card_number fields and turns query variations into garbage
+// like "Michael Jordan 1986-87 Fleer #57 #57".  Strip those tokens (plus
+// grading and rookie markers) so the queries are built from a clean core
+// name like "Michael Jordan".
+function cleanPcName(item) {
+  const { name, set_name } = item;
+  let n = ` ${name ?? ''} `;
+  if (set_name) n = n.replace(new RegExp(escapeRegExp(set_name.trim()), 'ig'), ' ');
+  n = n
+    .replace(/\b(19|20)\d{2}\s*[-/–]\s*\d{2,4}\b/g, ' ')             // seasons: 1986-87
+    .replace(/\b(19|20)\d{2}\b/g, ' ')                               // plain years
+    .replace(/#\s*[a-z0-9-]+\b/gi, ' ')                              // card numbers
+    .replace(/\b(psa|bgs|sgc|cgc|beckett)\s*\d+(\.\d+)?\b/gi, ' ')   // grade strings
+    .replace(/\b(rookie\s+card|rookie|rc)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return n || (name ?? '').trim();
+}
+
 // Build the deduplicated query-variation ladder for an item (most → least specific).
 function buildPcQueries(item) {
   const { name, year, set_name, card_number } = item;
-  // First word of set_name used as the short brand token
-  // e.g. "Topps Chrome" → "Topps",  "Panini Prizm" → "Panini"
-  const brandShort = set_name ? set_name.trim().split(/\s+/)[0] : null;
+  const coreName = cleanPcName(item);
+
+  // Brand token from set_name with any leading year/season stripped —
+  // "1986-87 Fleer" → "Fleer", "Topps Chrome" → "Topps".
+  const setBrand   = set_name ? set_name.replace(/\b(19|20)\d{2}([-/–]\d{2,4})?\b/g, ' ').trim() : '';
+  const brandShort = setBrand ? setBrand.split(/\s+/)[0] : null;
 
   const rawVariations = [
-    card_number ? `${name} #${card_number}` : null,
-    [name, year, brandShort].filter(Boolean).join(' '),
-    [name, set_name].filter(Boolean).join(' '),
-    [name, year].filter(Boolean).join(' '),
+    card_number ? `${coreName} #${card_number}` : null,
+    [coreName, year, brandShort].filter(Boolean).join(' '),
+    [coreName, setBrand || set_name].filter(Boolean).join(' '),
+    [coreName, year].filter(Boolean).join(' '),
+    coreName,
+    // Raw name last — only differs from coreName for scan-style names, and
+    // by then every structured variation has already been tried.
     name,
   ];
-  return [...new Set(rawVariations.filter(Boolean).map(q => q.trim()))];
+  return [...new Set(rawVariations.filter(Boolean).map(q => q.trim()).filter(Boolean))];
 }
 
 // Run the full query-variation ladder against one domain.
 // Returns { price, image, field, productName, consoleName } or null.
 async function pcLookupOnBase(baseUrl, item, token) {
-  const { year, set_name, condition } = item;
+  const { year, set_name, card_number, condition } = item;
   const tEnc    = encodeURIComponent(token);
   const queries = buildPcQueries(item);
   const host    = new URL(baseUrl).hostname.replace(/^www\./, '');
@@ -794,8 +834,18 @@ async function pcLookupOnBase(baseUrl, item, token) {
         continue;
       }
       const scored = candidates
-        .map(p => ({ p, score: scorePcProduct(p, year, set_name) }))
+        .map(p => ({ p, score: scorePcProduct(p, year, set_name, card_number) }))
         .sort((a, b) => b.score - a.score);
+
+      // When the item carries identifying fields, never accept a best match
+      // that corroborates NONE of them (score ≤ 0).  A name-only hit from a
+      // broad query can be a different card entirely — wrong set, wrong era,
+      // wrong card number — whose price is wildly off (e.g. a $20 junk-wax
+      // Jordan pricing a 1986 Fleer #57).
+      if ((year || set_name || card_number) && scored[0].score <= 0) {
+        console.log(`[pricecharting] ${tryTag}: best match "${scored[0].p['product-name']}" (${scored[0].p['console-name'] ?? '?'}) scored ${scored[0].score} — rejected, trying next query`);
+        continue;
+      }
       const best = scored[0].p;
 
       // ── Step 2: fetch full price data by product ID ─────────────────────
