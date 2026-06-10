@@ -2,7 +2,8 @@ const express = require('express');
 const pool    = require('../db');
 const {
   runEbayJob, priceSingleItem, fetchPriceCharting,
-  scorePcProduct, buildPcQueries, pcPriceForGrade, PC_BASES, PC_JUNK_CONSOLE_RE,
+  scorePcProduct, buildPcQueries, pcPriceForGrade, extractPcHistoryPoints,
+  PC_BASES, PC_JUNK_CONSOLE_RE,
 } = require('../jobs/ebay');
 
 const router = express.Router();
@@ -262,6 +263,13 @@ router.get('/test-pricecharting', async (req, res) => {
           graded_price:       (product['graded-price']       ?? 0) / 100,
           condition_17_price: (product['condition-17-price'] ?? 0) / 100,
           condition_18_price: (product['condition-18-price'] ?? 0) / 100,
+          // Every *-price field with data — reveals condition-keyed fields
+          // beyond the five standard tiers
+          all_price_fields: Object.fromEntries(
+            Object.entries(product)
+              .filter(([k, v]) => /-price$/.test(k) && typeof v === 'number' && v > 0)
+              .map(([k, v]) => [k, v / 100])
+          ),
           selected_dollars: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
           image_field:      imageField,
           image:            imageField ? product[imageField] : null,
@@ -276,6 +284,23 @@ router.get('/test-pricecharting', async (req, res) => {
         tried.push(entry);
 
         if (cents != null) {
+          // Probe the candidate history endpoints for the matched product so
+          // production responses show exactly what history data is available.
+          const historyProbe = [];
+          for (const hUrl of [
+            `${baseUrl}/api/product/prices?t=${tEnc}&id=${encodeURIComponent(productId)}`,
+            `${baseUrl}/api/sales?t=${tEnc}&id=${encodeURIComponent(productId)}`,
+            `${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(productId)}&country=US`,
+          ]) {
+            const raw = await pcRawFetch(hUrl);
+            historyProbe.push({
+              url:           hUrl.replace(tEnc, maskedToken),
+              http_status:   raw.http_status,
+              raw_body:      raw.raw_body,
+              parsed_points: raw.parsed ? extractPcHistoryPoints(raw.parsed).length : 0,
+            });
+          }
+
           return res.json({
             ok:             true,
             winning_base:   host,
@@ -283,6 +308,7 @@ router.get('/test-pricecharting', async (req, res) => {
             winning_query:  q,
             slabr_price:    entry.selected_dollars,
             condition,
+            history_probe:  historyProbe,
             token_info:     tokenInfo,
             probe_results:  probeResults,
             variations:     tried,

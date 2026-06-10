@@ -349,6 +349,9 @@ async function _runEbayJobInner(hasEbay) {
               [pc.image, combo.catalog_id]
             );
           }
+
+          // One-time historic backfill per combo (no-op once history exists)
+          await maybeBackfillPcHistory(combo.catalog_id, combo.condition, combo.grade, pc);
         }
       } else {
         skippedOneOfOne++;
@@ -721,6 +724,11 @@ function scorePcProduct(product, year, set_name, card_number) {
 //              9 → cib | 8.5 → avg(cib, graded) | 8 → cib
 //              7.5 → avg(loose, cib) | ≤7 → loose
 //
+// The 8.5 interpolation is CLAMPED to 40–60% of the graded tier: cib and
+// graded sit far apart on iconic cards and a plain midpoint overshoots what
+// 8.5s actually realize.  (Grade-specific SCP products, when they exist, are
+// preferred over any interpolation — see pcGradeSpecificLookup.)
+//
 // When one side of an average has no data, the available side is used alone;
 // exact tiers fall back down the ladder when their field is empty.
 // Returns { cents, field } or null when no usable price exists.
@@ -753,7 +761,30 @@ function pcPriceForGrade(product, item) {
                              : avg('graded-price', 'condition-17-price');
   if (g >= 9)   return isBgs ? single('cib-price')                     // BGS 9 ≈ PSA 8 tier
                              : single('graded-price');
-  if (g >= 8.5) return avg('cib-price', 'graded-price');
+  if (g >= 8.5) {
+    const graded = val('graded-price');
+    const cib    = val('cib-price');
+    // Clamp interpolated 8.5s into a 40–60% band of the graded tier; the
+    // lower bound never drops below the cib (8) tier so an 8.5 can't price
+    // under an 8 when the tiers sit close together.
+    if (graded != null && cib != null) {
+      const mid   = Math.round((cib + graded) / 2);
+      const floor = Math.max(Math.round(graded * 0.40), cib);
+      const ceil  = Math.max(Math.round(graded * 0.60), floor);
+      const cents = Math.min(Math.max(mid, floor), ceil);
+      return {
+        cents,
+        field: cents === mid
+          ? 'avg(cib-price, graded-price)'
+          : 'avg(cib-price, graded-price) clamped to 40-60% of graded-price',
+      };
+    }
+    // Only the graded (9) tier has data — an 8.5 must never price at the
+    // full 9-tier value, so the 60% ceiling applies directly.
+    if (graded != null) return { cents: Math.round(graded * 0.60), field: 'graded-price scaled to 60% (8.5 ceiling)' };
+    if (cib    != null) return { cents: cib, field: 'cib-price' };
+    return single('loose-price');
+  }
   if (g >= 8)   return single('cib-price');
   if (g >= 7.5) return avg('loose-price', 'cib-price');
   return single('loose-price');                                        // 7 and below ≈ raw floor
@@ -829,13 +860,120 @@ function buildPcQueries(item) {
   return [...new Set(rawVariations.filter(Boolean).map(q => q.trim()).filter(Boolean))];
 }
 
+function isHalfGrade(grade) {
+  const g = parseFloat(grade);
+  return !isNaN(g) && g % 1 !== 0;
+}
+
+// Log every *-price field PC returned for a matched product — visibility into
+// what grade-specific pricing the API actually exposes (condition-17/18 hint
+// there may be more condition-keyed fields than the documented five).
+function logPcPriceFields(product) {
+  const prices = {};
+  for (const [k, v] of Object.entries(product)) {
+    if (/-price$/.test(k) && typeof v === 'number' && v > 0) {
+      prices[k] = `$${(v / 100).toFixed(2)}`;
+    }
+  }
+  console.log(`[pricecharting] price fields for "${product['product-name']}": ${JSON.stringify(prices)}`);
+}
+
+// Half grades sometimes exist as their own SCP product entry (e.g.
+// "Michael Jordan #57 [BGS 8.5]") with exact market data — always better
+// than tier interpolation.  Searches "name #num BGS 8.5" and only trusts
+// products whose name/console explicitly carries that grade marker, so the
+// regular (all-grades) product can never be mistaken for a grade-specific one.
+// Returns the same shape as pcLookupOnBase, or null when no entry exists.
+async function pcGradeSpecificLookup(baseUrl, item, token) {
+  const { condition, grading_company, grade, card_number, year, set_name } = item;
+  if (condition !== 'graded' || !grading_company || !isHalfGrade(grade)) return null;
+
+  const co = grading_company.toUpperCase() === 'BECKETT' ? 'BGS' : grading_company.toUpperCase();
+  if (!['BGS', 'SGC'].includes(co)) return null;
+
+  const coreName = cleanPcName(item);
+  const gradeTag = `${co} ${grade}`;
+  const gradeRe  = new RegExp(`${co.toLowerCase()}[\\s-]*${escapeRegExp(String(grade))}(?![0-9])`, 'i');
+  const tEnc     = encodeURIComponent(token);
+  const host     = new URL(baseUrl).hostname.replace(/^www\./, '');
+
+  const queries = [...new Set([
+    card_number ? `${coreName} #${card_number} ${gradeTag}` : null,
+    `${coreName} ${gradeTag}`,
+  ].filter(Boolean))];
+
+  for (const q of queries) {
+    try {
+      console.log(`[pricecharting] ${host} grade-specific: search "${q}"`);
+      const resp = await fetch(`${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(10_000) });
+      if (!resp.ok) continue;
+      const data = await resp.json().catch(() => null);
+      if (!data || data.status !== 'success' || !data.products?.length) continue;
+
+      // Only products that explicitly name this grade qualify.
+      const gradeProducts = data.products.filter(p =>
+        gradeRe.test(`${p['product-name'] ?? ''} ${p['console-name'] ?? ''}`) &&
+        !PC_JUNK_CONSOLE_RE.test(p['console-name'] ?? ''));
+      if (!gradeProducts.length) {
+        console.log(`[pricecharting] ${host} grade-specific: no products carry "${gradeTag}" — falling back to tier mapping`);
+        continue;
+      }
+
+      const scored = gradeProducts
+        .map(p => ({ p, score: scorePcProduct(p, year, set_name, card_number) }))
+        .sort((a, b) => b.score - a.score);
+      if ((year || set_name || card_number) && scored[0].score <= 0) continue;
+      const best = scored[0].p;
+
+      let product = best;
+      if (best.id) {
+        try {
+          const priceResp = await fetch(`${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(best.id)}`, { signal: AbortSignal.timeout(10_000) });
+          if (priceResp.ok) {
+            const priceData = await priceResp.json().catch(() => null);
+            if (priceData?.status === 'success') product = priceData;
+          }
+        } catch (_) { /* keep search-result product */ }
+      }
+      logPcPriceFields(product);
+
+      // A grade-specific product's graded-price IS this grade's market value;
+      // some entries carry it under loose-price instead.
+      const cents = (product['graded-price'] > 0 ? product['graded-price'] : null)
+                 ?? (product['loose-price']  > 0 ? product['loose-price']  : null);
+      if (cents == null) continue;
+
+      const price = parseFloat((cents / 100).toFixed(2));
+      const image = await pcProductImage(product);
+      console.log(`[pricecharting] ${host} grade-specific matched: "${product['product-name']}" | ${product['console-name'] ?? '?'} — $${price} via "${q}"`);
+      return {
+        price,
+        image,
+        field:       'graded-price (grade-specific product)',
+        productId:   best.id ?? null,
+        baseUrl,
+        productName: product['product-name'],
+        consoleName: product['console-name'] ?? best['console-name'] ?? null,
+      };
+    } catch (err) {
+      console.error(`[pricecharting] ${host} grade-specific error for "${q}": ${err.message}`);
+    }
+  }
+  return null;
+}
+
 // Run the full query-variation ladder against one domain.
-// Returns { price, image, field, productName, consoleName } or null.
+// Returns { price, image, field, productId, baseUrl, productName, consoleName } or null.
 async function pcLookupOnBase(baseUrl, item, token) {
   const { year, set_name, card_number, condition } = item;
   const tEnc    = encodeURIComponent(token);
   const queries = buildPcQueries(item);
   const host    = new URL(baseUrl).hostname.replace(/^www\./, '');
+
+  // Half grades: a grade-specific product entry (exact market data) beats
+  // any tier mapping or interpolation.
+  const gradeSpecific = await pcGradeSpecificLookup(baseUrl, item, token);
+  if (gradeSpecific) return gradeSpecific;
 
   for (let i = 0; i < queries.length; i++) {
     const q      = queries[i];
@@ -896,6 +1034,8 @@ async function pcLookupOnBase(baseUrl, item, token) {
         }
       }
 
+      logPcPriceFields(product);
+
       // Grade-aware price selection — half grades interpolate between the two
       // surrounding tier prices.  Values are cents; 0 means "no price recorded".
       const priced = pcPriceForGrade(product, item);
@@ -912,6 +1052,8 @@ async function pcLookupOnBase(baseUrl, item, token) {
         price,
         image,
         field,
+        productId:   best.id ?? null,
+        baseUrl,
         productName: product['product-name'],
         consoleName: product['console-name'] ?? best['console-name'] ?? null,
       };
@@ -937,6 +1079,163 @@ async function fetchPriceCharting(item) {
 
   console.log('[pricecharting] all domains and query variations exhausted — no usable price');
   return null;
+}
+
+// ── PriceCharting price history ───────────────────────────────────────────────
+//
+// PC doesn't document a history endpoint, so every known candidate is probed
+// and the response parsed leniently for {date, price}-shaped entries:
+//   1. /api/product/prices?t=&id=          (undocumented, reported to exist)
+//   2. /api/sales?t=&id=                   (listed in PC's endpoint inventory)
+//   3. /api/product?t=&id=&country=US      (main product call — some guides
+//                                           attach history arrays here)
+// Whatever responds first with parseable points wins.  Numeric prices are
+// cents (PC convention); "$1,234.56" strings are dollars.
+
+const PC_DATE_KEYS  = ['date', 'sale-date', 'sold-date', 'created-date', 'transaction-date', 'when'];
+const PC_PRICE_KEYS = ['price', 'sale-price', 'sold-price', 'close-price', 'amount', 'value'];
+
+// Scan a response object for the first array whose entries carry a date and a
+// price.  Returns [{date: 'YYYY-MM-DD', cents}] — one point per day (last
+// sale of the day wins), capped to the most recent 120 days.
+function extractPcHistoryPoints(data) {
+  if (!data || typeof data !== 'object') return [];
+  // A bare top-level array is the most natural shape for a sales endpoint
+  const arrays = Array.isArray(data)
+    ? [data]
+    : Object.values(data).filter(v => Array.isArray(v) && v.length);
+
+  for (const arr of arrays) {
+    const points = [];
+    for (const entry of arr) {
+      if (entry == null || typeof entry !== 'object') continue;
+
+      let date = null;
+      for (const k of PC_DATE_KEYS) {
+        const d = entry[k];
+        if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}/.test(d)) { date = d.slice(0, 10); break; }
+      }
+
+      let cents = null;
+      for (const k of PC_PRICE_KEYS) {
+        const p = entry[k];
+        if (typeof p === 'number' && p > 0) { cents = Math.round(p); break; }
+        if (typeof p === 'string') {
+          const n = parseFloat(p.replace(/[$,]/g, ''));
+          if (!isNaN(n) && n > 0) { cents = Math.round(n * 100); break; }
+        }
+      }
+
+      if (date && cents != null) points.push({ date, cents });
+    }
+
+    if (points.length) {
+      const byDay = new Map();
+      for (const pt of points.sort((a, b) => a.date.localeCompare(b.date))) {
+        byDay.set(pt.date, pt.cents);
+      }
+      return [...byDay.entries()].map(([date, cents]) => ({ date, cents })).slice(-120);
+    }
+  }
+  return [];
+}
+
+async function fetchPcPriceHistory(baseUrl, productId, token) {
+  const tEnc = encodeURIComponent(token);
+  const idEnc = encodeURIComponent(productId);
+  const candidates = [
+    `${baseUrl}/api/product/prices?t=${tEnc}&id=${idEnc}`,
+    `${baseUrl}/api/sales?t=${tEnc}&id=${idEnc}`,
+    `${baseUrl}/api/product?t=${tEnc}&id=${idEnc}&country=US`,
+  ];
+
+  for (const url of candidates) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (!resp.ok) continue;
+      const data = await resp.json().catch(() => null);
+      if (!data || data.status === 'error') continue;
+      const points = extractPcHistoryPoints(data);
+      if (points.length) {
+        console.log(`[pricecharting] history: ${points.length} daily points via ${url.replace(tEnc, '***')}`);
+        return points;
+      }
+    } catch (_) { /* try next candidate */ }
+  }
+
+  console.log(`[pricecharting] history: no candidate endpoint returned parseable points for id=${productId}`);
+  return [];
+}
+
+// Insert historic points as pricecharting rows for one (catalog, condition,
+// grade) combo, skipping dates that already have a pricecharting row.
+// Only STRICTLY PAST dates are inserted — today's value comes exclusively
+// from the live grade-mapped pricer, so a product-level history point can
+// never shadow it (recorded_at ranking would otherwise prefer the noon-
+// stamped backfill row over the 3 AM cron row all day).
+// Points outside [lo, hi] × todayPrice (dollars) are dropped — the history
+// endpoints are product-level, and an off-scale point usually means a sale
+// of a different grade.
+async function backfillPcHistory(catalogId, condition, grade, points, todayPrice, lo = 0.25, hi = 4) {
+  const today = new Date().toISOString().slice(0, 10);
+  const sane = points.filter(pt =>
+    pt.date < today &&
+    (todayPrice == null || (pt.cents >= todayPrice * 100 * lo && pt.cents <= todayPrice * 100 * hi)));
+
+  let inserted = 0;
+  for (const { date, cents } of sane) {
+    const { rowCount } = await pool.query(`
+      INSERT INTO price_history (catalog_id, condition, grade, sold_median, active_low, source, recorded_at)
+      SELECT $1, $2, $3, $4, NULL, 'pricecharting', $5::date + INTERVAL '12 hours'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM price_history
+        WHERE catalog_id = $1
+          AND condition IS NOT DISTINCT FROM $2
+          AND grade     IS NOT DISTINCT FROM $3
+          AND source = 'pricecharting'
+          AND recorded_at::date = $5::date
+      )
+    `, [catalogId, condition, grade, (cents / 100).toFixed(2), date]);
+    inserted += rowCount;
+  }
+  return inserted;
+}
+
+// One-time-per-combo history backfill: only runs while the combo has fewer
+// than 2 pricecharting rows (i.e. right after its first successful match).
+async function maybeBackfillPcHistory(catalogId, condition, grade, pc) {
+  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  if (!pc?.productId || !pc?.baseUrl || !token) return;
+  try {
+    const { rows } = await pool.query(`
+      SELECT COUNT(*)::int AS n FROM price_history
+      WHERE catalog_id = $1
+        AND condition IS NOT DISTINCT FROM $2
+        AND grade     IS NOT DISTINCT FROM $3
+        AND source = 'pricecharting'
+    `, [catalogId, condition, grade]);
+    if (rows[0].n >= 2) return; // already has history — daily cron extends it
+
+    const points = await fetchPcPriceHistory(pc.baseUrl, pc.productId, token);
+
+    // Sanity-band width depends on how much the history can be trusted to be
+    // THIS grade's series:
+    //   grade-specific product → its history IS this grade        (wide)
+    //   raw / ungraded item    → product history tracks raw sales (medium)
+    //   generic graded match   → product-level data may mix grades; a narrow
+    //                            band rejects adjacent-tier contamination
+    const gradeSpecific = (pc.field ?? '').includes('grade-specific');
+    const [lo, hi] = gradeSpecific            ? [0.25, 4]
+                   : condition !== 'graded'   ? [0.5, 2]
+                   :                            [0.6, 1.67];
+
+    const inserted = await backfillPcHistory(catalogId, condition, grade, points, pc.price, lo, hi);
+    if (inserted) {
+      console.log(`[pricecharting] backfilled ${inserted} historic points for catalog_id=${catalogId} (${condition} ${grade ?? ''}, band ${lo}-${hi}x)`);
+    }
+  } catch (err) {
+    console.warn(`[pricecharting] history backfill failed for catalog_id=${catalogId}: ${err.message}`);
+  }
 }
 
 // ── Instant single-item pricer (called right after a portfolio add) ───────────
@@ -1004,6 +1303,10 @@ async function priceSingleItem(catalogId, condition, grade) {
         );
         console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}`);
       }
+
+      // First match for this combo also backfills PC's historic prices so the
+      // chart shows weeks of real data instead of starting from today.
+      await maybeBackfillPcHistory(catalogId, condition, grade, pc);
     }
   }
 
@@ -1058,5 +1361,6 @@ async function priceSingleItem(catalogId, condition, grade) {
 module.exports = {
   runEbayJob, ebaySearch, priceSingleItem, fetchActiveListings,
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
+  extractPcHistoryPoints, fetchPcPriceHistory,
   PC_BASES, PC_JUNK_CONSOLE_RE,
 };
