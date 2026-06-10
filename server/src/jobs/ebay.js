@@ -307,7 +307,8 @@ async function _runEbayJobInner(hasEbay) {
       pi.catalog_id, pi.condition, pi.grade, pi.grading_company,
       pi.is_one_of_one,
       mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
-      mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity
+      mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity,
+      mc.ebay_item_id
     FROM portfolio_items pi
     JOIN master_catalog mc ON pi.catalog_id = mc.id
     ORDER BY pi.catalog_id, pi.condition, pi.grade
@@ -438,207 +439,6 @@ async function _runEbayJobInner(hasEbay) {
   const result = { updated, errors, skippedOneOfOne, elapsed };
   console.log(`[ebay-job] Done in ${elapsed}s —`, JSON.stringify(result));
   return result;
-}
-
-// ── Catalog search helper (used by GET /api/catalog/search) ──────────────────
-//
-// Returns up to `limit` eBay results mapped to the catalog item shape:
-//   { source, ebay_item_id, name, item_type, year, set_name,
-//     image_url, current_value, condition }
-
-function inferItemType(item) {
-  const title = (item.title ?? '').toLowerCase();
-  const cats  = (item.categories ?? []).map(c => (c.categoryName ?? '').toLowerCase());
-  if (cats.some(c => /tcg|pokemon|magic.*gathering|yugioh|trading card game/.test(c))) return 'tcg';
-  if (cats.some(c => c.includes('comic'))) return 'comic';
-  if (cats.some(c => c.includes('sealed')) || /sealed box|sealed pack/.test(title)) return 'sealed';
-  return 'sports_card';
-}
-
-// eBay category IDs that cover the entire collectibles card universe.
-// Passing these eliminates shoes, clothing, car parts, etc.
-//   212      — Sports Trading Cards
-//   183454   — CCG Individual Cards (Pokémon, MTG, Yu-Gi-Oh…)
-//   259104   — Comics
-//   183456   — Sealed Trading Card Packs & Sets
-const CARD_CATEGORY_IDS = '212,183454,259104,183456';
-
-// Allowed eBay category IDs — used to reject results that slipped through
-// the categoryIds request filter.  Mirrors CARD_CATEGORY_IDS as a Set for O(1) lookup.
-//   212      — Sports Trading Cards
-//   183454   — CCG Individual Cards
-//   259104   — Comics
-//   183456   — Sealed Trading Card Packs & Sets
-const ALLOWED_CAT_IDS = new Set(['212', '183454', '259104', '183456']);
-
-// Returns true if the item belongs to a known card category (or has no category
-// data — eBay doesn't always populate this field, so we fail open).
-function hasValidCategory(item) {
-  const cats = item.categories ?? [];
-  if (!cats.length) return true;
-  return cats.some(c => ALLOWED_CAT_IDS.has(String(c.categoryId)));
-}
-
-// Storage/accessory words that indicate a card holder, sleeve, binder, or
-// case product rather than an actual card.  We block these UNLESS the title
-// also contains a grading company — e.g. "PSA 9 slab case" is a legitimate
-// graded card; a plain "card sleeve" or "binder" is not what we want to show.
-const STORAGE_WORD_RE = /\b(holder|sleeve|binder)\b|(?<!\w)case(?!\s*(?:study|base))/i;
-const GRADING_CO_RE   = /\b(psa|bgs|sgc|cgc)\b/i;
-
-// Title patterns that definitively indicate non-card merchandise.
-// Applied as a client-side safety net after eBay's category filter.
-const REJECT_TITLE_RE =
-  /\b(t-shirt|hoodie|sweatshirt|sneakers?|shoes?|shoe|boot|clothing|apparel|jersey(?!\s*card)|car\s*part|auto\s*part|bumper|tire|tyre|hat|cap|pants|jacket|adult|sexy|nude|bra|lingerie|bikini|swimsuit|nsfw|waifu|ecchi|gravure|yeezy|plush|fender|sticker|stamp|coin|patch(?!\s*(?:card|auto))|pin|poster|shirt|funko|figure(?!\s*card)|toy|magazine|video\s+game|dvd|book(?!let)|liftgate|chevy|gmc|truck)\b|air\s+jordan|jordan\s+\d+\s*(mid|low|high|og|retro)\b|size\s+\d{1,2}\b|blu[-\s]?ray|8\s*[xX]\s*10|18\+|signed\s+(photo|jersey|shirt|print)|anime\s+girl|idol\s+photo/i;
-
-// Whitelisted TCG game names.  Any result classified as 'tcg' must match
-// at least one of these or it is filtered out (blocks unknown or inappropriate
-// TCG content from eBay's CCG category).
-const TCG_GAME_RE =
-  /\b(pokemon|pok[eé]mon|magic|m\.?t\.?g\.?|yu[-\s]?gi[-\s]?oh|yugioh|one\s+piece|dragon\s+ball|lorcana|flesh\s+and\s+blood|digimon|naruto|final\s+fantasy)\b/i;
-
-// Positive context filter — every surviving result must contain at least one
-// sport, brand, grade, or game term.  This is the last-resort backstop after
-// REJECT_TITLE_RE; it kills adult-content listings that append "trading card"
-// to an otherwise unrelated title.
-//
-// Covers:
-//   • League abbreviations  : nba / nfl / mlb / nhl / mls
-//   • Sports by name        : basketball, football, baseball, soccer, hockey
-//   • Card-specific terms   : rookie, refractor, prizm, auto, patch, card
-//   • Grading companies     : psa, bgs, sgc, cgc
-//   • Serial number patterns: /10  /25  /50  /99  /100 … /299  and  #/N
-//   • Card manufacturers    : topps, panini, bowman, donruss, fleer, score,
-//                             leaf, upper deck
-//   • TCG titles            : pokemon, pikachu, charizard, mtg,
-//                             magic the gathering, yugioh, one piece,
-//                             dragon ball, lorcana
-const CONTENT_CONTEXT_RE =
-  /\b(nba|nfl|mlb|nhl|mls|basketball|football|baseball|soccer|hockey|rookie|refractor|prizm|psa|bgs|sgc|cgc|panini|topps|bowman|donruss|fleer|score|leaf|pokemon|pok[eé]mon|pikachu|charizard|mtg|lorcana|yugioh|yu[-\s]?gi[-\s]?oh|card|auto|patch)\b|\bupper\s+deck\b|magic\s+the\s+gathering|one\s+piece|dragon\s+ball|#\/\d+|\/(10|25|50|99|100|149|199|249|299)\b/i;
-
-async function ebaySearch(query, limit = 25) {
-  const token = await getToken();
-  const env   = (process.env.EBAY_ENV ?? 'production').toLowerCase();
-  const base  = API_BASE[env] ?? API_BASE.production;
-
-  // Append "trading card" to vague queries (e.g. "jordan 1") so eBay's
-  // relevance engine ranks card listings first instead of sneakers or car parts.
-  //
-  // EXCEPTION: skip the append when the user already typed an explicit card
-  // signal (grading company, major brand, card-number pattern).  Adding
-  // "trading card" to "LeBron James Topps Chrome PSA 10 111" makes eBay
-  // require ALL of those tokens AND "trading" AND "card" in the same title,
-  // which returns 0 raw results for even the most iconic cards.
-  const QUERY_CARD_SIGNAL_RE =
-    /\b(psa|bgs|sgc|cgc|topps|panini|bowman|donruss|fleer|upper\s*deck|chrome|prizm|refractor|optic|pokemon|pok[eé]mon|mtg|yugioh)\b|#\d+|\d+\/\d+/i;
-
-  const base_q = QUERY_CARD_SIGNAL_RE.test(query.trim())
-    ? query.trim()                          // already card-specific — don't over-constrain
-    : `${query.trim()} trading card`;       // vague query — nudge eBay toward cards
-
-  // Negative keywords tell eBay's relevance engine to deprioritise junk.
-  const q = `${base_q} -shirt -shoes -sneaker -clothing -apparel -jersey -funko -poster`;
-
-  // ── Build URL manually ────────────────────────────────────────────────────
-  // URLSearchParams encodes commas as %2C.  eBay Browse API requires literal
-  // commas in categoryIds (e.g. "212,183454") — the encoded form is silently
-  // ignored, causing the category filter to have no effect.
-  const qs = [
-    `q=${encodeURIComponent(q)}`,
-    `limit=${Math.min(limit, 50)}`,
-    `categoryIds=${CARD_CATEGORY_IDS}`,                     // commas stay literal
-    `filter=${encodeURIComponent('buyingOptions:{FIXED_PRICE}')}`,
-    `sort=newlyListed`,
-  ].join('&');
-  const url = `${base}/buy/browse/v1/item_summary/search?${qs}`;
-
-  console.log(`[ebay] ebaySearch URL: ${url}`);
-
-  const res = await fetch(url, {
-    headers: {
-      Authorization:             `Bearer ${token}`,
-      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-      'X-EBAY-C-ENDUSERCTX':    'contextualLocation=country=US',
-    },
-    signal: AbortSignal.timeout(12_000),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`eBay search HTTP ${res.status}: ${text.slice(0, 160)}`);
-  }
-
-  const data  = await res.json();
-  const raw   = data.itemSummaries ?? [];
-
-  // ── Step 0: category sanity check ────────────────────────────────────────
-  // If eBay returned category metadata on the result, reject anything outside
-  // the Sports/TCG/Comic/Sealed card universe.  When no categories field is
-  // present we fail open (true) so legitimate cards are never silently dropped.
-  const afterCat = raw.filter(item => hasValidCategory(item));
-
-  // ── Step 1: reject non-card merchandise ──────────────────────────────────
-  // Hard block-list of title patterns that definitively indicate clothing,
-  // adult content, automotive parts, toys, and storage accessories.
-  // Storage words (holder/sleeve/binder/case) are a separate conditional check:
-  // rejected unless the title also contains PSA/BGS/SGC/CGC, which indicates
-  // the "case" or "holder" is part of a graded-slab listing, not an accessory.
-  const afterJunk = afterCat.filter(item => {
-    const title = item.title ?? '';
-    if (REJECT_TITLE_RE.test(title)) return false;
-    if (STORAGE_WORD_RE.test(title) && !GRADING_CO_RE.test(title)) return false;
-    return true;
-  });
-
-  // ── Step 2: map to catalog shape ──────────────────────────────────────────
-  const mapped = afterJunk.map(item => ({
-    source:        'ebay',
-    ebay_item_id:  item.itemId,
-    name:          item.title,
-    item_type:     inferItemType(item),
-    year:          null,
-    set_name:      null,
-    image_url:     item.image?.imageUrl ?? null,
-    current_value: item.price?.value != null ? parseFloat(item.price.value) : null,
-    condition:     item.condition ?? null,
-  }));
-
-  // ── Step 3: TCG whitelist — only pass known popular games ─────────────────
-  // Prevents unknown, adult-themed, or irrelevant CCG results from slipping
-  // through the category filter.
-  const afterTcg = mapped.filter(item => {
-    if (item.item_type !== 'tcg') return true;   // non-TCG items pass through
-    return TCG_GAME_RE.test(item.name ?? '');
-  });
-
-  // ── Step 4: deduplicate by title prefix (first 40 chars, lowercased) ──────
-  // eBay often returns near-identical listings for the same card (different
-  // sellers, same title).  Keep the first occurrence — eBay sorts by relevance
-  // so the first is the most relevant.  Prefer items with a real image.
-  const sorted = afterTcg.sort((a, b) => {
-    // Move items with an image URL to the front before deduping
-    const aHasImg = a.image_url ? 1 : 0;
-    const bHasImg = b.image_url ? 1 : 0;
-    return bHasImg - aHasImg;
-  });
-  const seen  = new Set();
-  const deduped = sorted.filter(item => {
-    const key = (item.name ?? '').toLowerCase().slice(0, 40);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  // ── Step 5: require sport/game/brand context ─────────────────────────────
-  // Final backstop — every result must contain at least one sport league term,
-  // card brand, grading company, TCG title, or serial-number pattern.
-  // Adult-content items that append "trading card" to their title fail here
-  // because they carry none of those signals.
-  const clean = deduped.filter(item => CONTENT_CONTEXT_RE.test(item.name ?? ''));
-
-  console.log(`[ebay] ebaySearch: ${raw.length} raw → ${afterCat.length} cat → ${afterJunk.length} junk → ${afterTcg.length} TCG → ${deduped.length} dedup → ${clean.length} context`);
-
-  return clean;
 }
 
 // ── PriceCharting price lookup ────────────────────────────────────────────────
@@ -798,12 +598,14 @@ const PC_IMAGE_FIELDS = ['image', 'image-url', 'image_url', 'photo', 'photo-url'
 // the predictable images CDN path, validated with a HEAD request so a wrong
 // guess can never save a broken URL.  Returns null when no image exists —
 // callers keep the item's current image in that case.
-async function pcProductImage(product) {
+// Pass { cdnFallback: false } in latency-sensitive paths (typeahead search)
+// to skip the HEAD probe.
+async function pcProductImage(product, { cdnFallback = true } = {}) {
   for (const f of PC_IMAGE_FIELDS) {
     const v = product[f];
     if (typeof v === 'string' && /^https?:\/\//.test(v)) return v;
   }
-  if (!product.id) return null;
+  if (!cdnFallback || !product.id) return null;
   const cdnUrl = `https://commondatastorage.googleapis.com/images.pricecharting.com/${product.id}/1600.jpg`;
   try {
     const head = await fetch(cdnUrl, { method: 'HEAD', signal: AbortSignal.timeout(6_000) });
@@ -974,6 +776,40 @@ async function pcLookupOnBase(baseUrl, item, token) {
   // any tier mapping or interpolation.
   const gradeSpecific = await pcGradeSpecificLookup(baseUrl, item, token);
   if (gradeSpecific) return gradeSpecific;
+
+  // Exact-product short-circuit: SCP-imported catalog rows carry the SCP
+  // product id in ebay_item_id (numeric) — fetch it directly instead of
+  // re-searching by text, which could land on a different card.  eBay-era
+  // ids ("v1|...|0") fail the numeric test and fall through to the ladder.
+  const directId = /^\d+$/.test(String(item.ebay_item_id ?? '')) ? String(item.ebay_item_id) : null;
+  if (directId) {
+    try {
+      const resp = await fetch(`${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(directId)}`, { signal: AbortSignal.timeout(10_000) });
+      if (resp.ok) {
+        const product = await resp.json().catch(() => null);
+        if (product?.status === 'success') {
+          logPcPriceFields(product);
+          const priced = pcPriceForGrade(product, item);
+          if (priced != null) {
+            const price = parseFloat((priced.cents / 100).toFixed(2));
+            const image = await pcProductImage(product);
+            console.log(`[pricecharting] ${host} direct-id ${directId} matched: "${product['product-name']}" | ${product['console-name'] ?? '?'} — $${price} from ${priced.field}`);
+            return {
+              price,
+              image,
+              field:       priced.field,
+              productId:   directId,
+              baseUrl,
+              productName: product['product-name'],
+              consoleName: product['console-name'] ?? null,
+            };
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[pricecharting] ${host} direct-id ${directId} lookup failed: ${err.message} — falling back to text search`);
+    }
+  }
 
   for (let i = 0; i < queries.length; i++) {
     const q      = queries[i];
@@ -1259,6 +1095,7 @@ async function priceSingleItem(catalogId, condition, grade) {
     SELECT
       mc.item_type, mc.name, mc.year, mc.set_name, mc.card_number,
       mc.brand_publisher, mc.sport_game, mc.ebay_search_query, mc.rarity,
+      mc.ebay_item_id,
       pi.grading_company, pi.is_one_of_one
     FROM master_catalog mc
     JOIN portfolio_items pi ON pi.catalog_id = mc.id
@@ -1358,8 +1195,134 @@ async function priceSingleItem(catalogId, condition, grade) {
   return { soldMedian, activeLow };
 }
 
+// ── SportsCardsPro catalog search (used by GET /api/catalog/search) ──────────
+//
+// Replaces the old eBay Browse search on the /add page.  Searches the SCP
+// database (then pricecharting.com — same API, covers Pokemon/TCG that SCP
+// doesn't index) and enriches each hit with prices and an image from the
+// per-product endpoint.
+
+// Non-card noise the search must never surface.  Standalone "pop" is NOT
+// junk — Pokemon "POP Series" promo sets and Leaf "Pop Century" are real card
+// products, and Funko consoles always carry the word "funko" anyway.
+// "figure" is bounded so Figure Skating sports cards survive.
+const SCP_SEARCH_JUNK_RE = /funko|\bpop!|video\s*game|amiibo|\bfigures?\b(?!\s*skating)/i;
+
+// Video-game platforms: pricecharting.com (the TCG fallback base) indexes
+// games whose console-name is the PLATFORM ("GameBoy", "Playstation 4") and
+// whose product-name is the game title ("Pokemon Red") — no text the junk
+// regex could catch.  Applied to console-name only.
+const SCP_PLATFORM_RE = /\b(game\s*boy|gameboy|nintendo|playstation|ps[1-5]|psp|ps\s*vita|xbox|sega|dreamcast|wii|switch|n64|gamecube|snes|nes|atari|neo\s*geo|turbografx|3ds|ds)\b/i;
+
+const SCP_TCG_RE   = /pokemon|magic|yu-?gi-?oh|lorcana|one\s+piece|dragon\s+ball|digimon|flesh\s+and\s+blood/i;
+const SCP_SPORT_RE = /\b(basketball|football|baseball|hockey|soccer|wrestling|golf|tennis|racing|ufc|boxing)\b/i;
+
+function scpInferItemType(consoleName) {
+  const c = (consoleName ?? '').toLowerCase();
+  if (SCP_TCG_RE.test(c)) return 'tcg';
+  if (/comic/.test(c)) return 'comic';
+  return 'sports_card';
+}
+
+// "Basketball Cards 2003 Topps Chrome" → { year: 2003, sport: 'basketball',
+// set_name: 'Topps Chrome' }.  TCG consoles like "Pokemon Base Set" keep the
+// game as sport and the rest as the set.
+function scpParseConsole(consoleName) {
+  const cn = consoleName ?? '';
+
+  const yearMatch = cn.match(/\b(19|20)\d{2}\b/);
+  const year = yearMatch ? parseInt(yearMatch[0], 10) : null;
+
+  const sportMatch = cn.match(SCP_SPORT_RE) ?? cn.match(SCP_TCG_RE);
+  const sport = sportMatch ? sportMatch[0].toLowerCase() : null;
+
+  // Brand/set: strip the "<sport> Cards" prefix and year tokens
+  let set = cn
+    .replace(/^.*?\bcards?\b\s*/i, '')
+    .replace(/\b(19|20)\d{2}([-/]\d{2,4})?\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!set && sportMatch) {
+    set = cn.replace(sportMatch[0], '').replace(/\s+/g, ' ').trim();
+  }
+
+  return { year, sport, set_name: set || null };
+}
+
+// Returns results mapped to the catalog shape the /add page expects.
+// The SCP product id is stored in ebay_item_id (reused column) so future
+// lookups can reference the exact product.
+async function scpSearch(query, limit = 8) {
+  const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
+  if (!token) return [];
+  const tEnc = encodeURIComponent(token);
+
+  for (const baseUrl of PC_BASES) {
+    try {
+      const resp = await fetch(`${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(10_000) });
+      if (!resp.ok) continue;
+      const data = await resp.json().catch(() => null);
+      if (!data || data.status !== 'success' || !data.products?.length) continue;
+
+      const candidates = data.products
+        .filter(p => !SCP_SEARCH_JUNK_RE.test(`${p['console-name'] ?? ''} ${p['product-name'] ?? ''}`))
+        .filter(p => !SCP_PLATFORM_RE.test(p['console-name'] ?? ''))
+        .slice(0, limit);
+      if (!candidates.length) continue;
+
+      // Enrich with prices + image via the per-product endpoint (parallel)
+      const enriched = await Promise.all(candidates.map(async p => {
+        let product = p;
+        try {
+          const r = await fetch(`${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(p.id)}`, { signal: AbortSignal.timeout(10_000) });
+          if (r.ok) {
+            const d = await r.json().catch(() => null);
+            if (d?.status === 'success') product = d;
+          }
+        } catch (_) { /* keep search-result fields */ }
+
+        const consoleName = product['console-name'] ?? p['console-name'] ?? '';
+        const productName = product['product-name'] ?? p['product-name'] ?? '';
+        const { year, sport, set_name } = scpParseConsole(consoleName);
+
+        // Card number from the product name ("Michael Jordan #57" → "57") —
+        // stored on the catalog row so later re-pricing keeps the scorer's
+        // card-number signal.
+        const cnMatch = productName.match(/#\s*([A-Za-z0-9-]+)/);
+
+        // Reference price: raw first, graded as fallback (cents → dollars)
+        const cents = (product['loose-price']  > 0 ? product['loose-price']  : null)
+                   ?? (product['graded-price'] > 0 ? product['graded-price'] : null);
+
+        return {
+          source:        'scp',
+          ebay_item_id:  String(product.id ?? p.id),
+          name:          productName,
+          item_type:     scpInferItemType(consoleName),
+          year,
+          set_name,
+          card_number:   cnMatch?.[1] ?? null,
+          sport_game:    product.genre ?? sport,
+          // No CDN HEAD probe here — typeahead latency matters more than a
+          // guaranteed thumbnail; the real image is saved at pricing time.
+          image_url:     await pcProductImage(product, { cdnFallback: false }),
+          current_value: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
+          condition:     null,
+        };
+      }));
+
+      console.log(`[scp-search] "${query}" → ${enriched.length} result(s) via ${new URL(baseUrl).hostname}`);
+      return enriched;
+    } catch (err) {
+      console.error(`[scp-search] ${baseUrl} error: ${err.message}`);
+    }
+  }
+
+  return [];
+}
+
 module.exports = {
-  runEbayJob, ebaySearch, priceSingleItem, fetchActiveListings,
+  runEbayJob, scpSearch, priceSingleItem, fetchActiveListings,
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
   extractPcHistoryPoints, fetchPcPriceHistory,
   PC_BASES, PC_JUNK_CONSOLE_RE,

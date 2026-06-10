@@ -193,48 +193,63 @@ export default function Add() {
   }
 
   // ── Debounced search ─────────────────────────────────────────────────────
+  // The in-flight request is aborted on every keystroke — SCP-enriched
+  // searches can be slow, and a stale slow response must never overwrite the
+  // results of a newer query.
   useEffect(() => {
     const q = query.trim();
     if (!q) { setResults([]); setManualMode(false); return; }
     setSearching(true);
+    const ctrl = new AbortController();
     const t = setTimeout(async () => {
       try {
-        const res = await fetch(`${API}/api/catalog/search?q=${encodeURIComponent(q)}`);
+        const res = await fetch(`${API}/api/catalog/search?q=${encodeURIComponent(q)}`, { signal: ctrl.signal });
         setResults(await res.json());
-      } catch {
-        setResults([]);
+      } catch (err) {
+        if (err.name !== 'AbortError') setResults([]);
       } finally {
-        setSearching(false);
+        if (!ctrl.signal.aborted) setSearching(false);
       }
     }, 350);
-    return () => clearTimeout(t);
+    return () => { clearTimeout(t); ctrl.abort(); };
   }, [query]);
 
   // ── Open add-panel ───────────────────────────────────────────────────────
-  // For eBay results: first upsert into master_catalog to get a real catalog_id,
-  // then open the grading/condition panel.
+  // For SportsCardsPro results: first upsert into master_catalog to get a real
+  // catalog_id, then open the grading/condition panel.
   async function openForm(item) {
     let catalogItem = item;
 
-    if (item.source === 'ebay') {
+    if (item.source === 'scp') {
       setRegisteringId(item.ebay_item_id);
       try {
-        const res = await fetch(`${API}/api/catalog/from-ebay`, {
+        const res = await fetch(`${API}/api/catalog/from-scp`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
-            ebay_item_id: item.ebay_item_id,
+            ebay_item_id: item.ebay_item_id,   // SCP product id (reused column)
             name:         item.name,
             item_type:    item.item_type,
             year:         item.year,
             set_name:     item.set_name,
+            card_number:  item.card_number,
+            sport_game:   item.sport_game,
             image_url:    item.image_url,
           }),
         });
         const data = await res.json();
-        if (res.ok) catalogItem = data;
+        if (!res.ok) {
+          // Without a real catalog_id the add flow would dead-end at the
+          // portfolio POST — stop here instead of opening a broken panel.
+          console.error('[slabr] from-scp failed:', data.error);
+          alert('Could not register this card — please try again.');
+          return;
+        }
+        catalogItem = data;
       } catch (err) {
-        console.error('[slabr] from-ebay error:', err.message);
+        console.error('[slabr] from-scp error:', err.message);
+        alert('Could not register this card — please try again.');
+        return;
       } finally {
         setRegisteringId(null);
       }
@@ -268,7 +283,7 @@ export default function Add() {
       const data = await res.json();
       if (!res.ok) { setManualError(data.error || 'Failed to create card'); return; }
       setManualMode(false);
-      openForm(data);  // data.source === 'manual', no eBay registration needed
+      openForm(data);  // data.source === 'manual', no catalog registration needed
     } catch {
       setManualError('Network error — is the server running?');
     } finally {
@@ -397,7 +412,7 @@ export default function Add() {
             {results.length > 0 && !manualMode && (
               <div className="space-y-2">
                 {results.map(item => {
-                  const key = item.source === 'ebay' ? item.ebay_item_id : String(item.id);
+                  const key = item.source === 'scp' ? item.ebay_item_id : String(item.id);
                   const isRegistering = registeringId === item.ebay_item_id;
                   const price = fmt(item.current_value);
 
@@ -435,7 +450,13 @@ export default function Add() {
                             <p className="text-zinc-500 text-xs mt-0.5 truncate">{item.set_name}</p>
                           )}
                           {price && (
-                            <p className="text-emerald-400 text-xs mt-0.5 font-medium">{price} on eBay</p>
+                            <p className="text-emerald-400 text-xs mt-0.5 font-medium">
+                              {price}
+                              {item.source === 'scp' && <span className="text-zinc-500 font-normal"> · via SportsCardsPro</span>}
+                            </p>
+                          )}
+                          {item.sport_game && (
+                            <p className="text-zinc-600 text-[11px] mt-0.5 capitalize">{item.sport_game}</p>
                           )}
                         </div>
 
@@ -566,7 +587,7 @@ export default function Add() {
             {/* Initial hint */}
             {!query.trim() && !manualMode && (
               <div className="text-center py-12 text-zinc-600 text-sm">
-                Type to search any card ever listed on eBay
+                Type to search the SportsCardsPro price guide
               </div>
             )}
           </div>
@@ -865,7 +886,10 @@ export default function Add() {
                     <p className="text-zinc-500 text-xs mt-0.5">{selectedItem.set_name}</p>
                   )}
                   {selectedItem.current_value != null && (
-                    <p className="text-emerald-400 text-xs mt-0.5">{fmt(selectedItem.current_value)} on eBay</p>
+                    <p className="text-emerald-400 text-xs mt-0.5">
+                      {fmt(selectedItem.current_value)}
+                      <span className="text-zinc-500"> · via SportsCardsPro</span>
+                    </p>
                   )}
                 </div>
               </div>
