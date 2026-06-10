@@ -656,7 +656,7 @@ async function ebaySearch(query, limit = 25) {
 // Prices are in CENTS — divide by 100 for dollars.
 // PriceCharting stores 0 for "no price recorded"; treat as missing.
 //
-// Price-field selection is grade-aware — see pcPriceFields().
+// Price selection is grade-aware with half-grade interpolation — see pcPriceForGrade().
 //
 // Query variations (most → least specific):
 //   Try 1: "name #card_number"           → "LeBron James #111"
@@ -702,30 +702,61 @@ function scorePcProduct(product, year, set_name, card_number) {
   return score;
 }
 
-// ── Grade → PriceCharting price-field mapping ────────────────────────────────
-// SportsCardsPro grade-specific price fields:
+// ── Grade → PriceCharting price selection ─────────────────────────────────────
+// SportsCardsPro grade-specific price fields (cents; 0 = no data):
 //   loose-price        = raw / ungraded
 //   cib-price          = PSA 8 / BGS 9 equivalent
-//   graded-price       = PSA 9 / BGS 9.5 equivalent
-//   condition-17-price = PSA 10 gem mint
+//   graded-price       = PSA 9 / BGS 9.5 equivalent (near mint)
+//   condition-17-price = PSA 10 / BGS 10
 //   condition-18-price = BGS 10 Black Label
 //
-// PSA grades run roughly half a grade below BGS/SGC equivalents, so the
-// graded-price cutoff is 9 for PSA but 9.5 for BGS/SGC half-grade scales.
-// Returns an ordered field chain — the first field with a value > 0 wins.
-function pcPriceFields(item) {
+// Half grades (7.5 / 8.5 / 9.5) fall BETWEEN those tiers and consistently
+// trade above the lower tier, so they interpolate — the price is the average
+// of the two surrounding tier prices:
+//
+//   PSA / SGC: 10 → c17 | 9.5 → avg(graded, c17) | 9 → graded
+//              8.5 → avg(cib, graded) | 8 → cib | 7.5 → avg(loose, cib)
+//              ≤7 → loose
+//   BGS:       10 → c17 (c18 fallback) | 9.5 → graded (tier definition)
+//              9 → cib | 8.5 → avg(cib, graded) | 8 → cib
+//              7.5 → avg(loose, cib) | ≤7 → loose
+//
+// When one side of an average has no data, the available side is used alone;
+// exact tiers fall back down the ladder when their field is empty.
+// Returns { cents, field } or null when no usable price exists.
+function pcPriceForGrade(product, item) {
+  const val = f => (product[f] > 0 ? product[f] : null);
+  const single = (...fields) => {
+    for (const f of fields) {
+      const v = val(f);
+      if (v != null) return { cents: v, field: f };
+    }
+    return null;
+  };
+  const avg = (fLow, fHigh) => {
+    const a = val(fLow);
+    const b = val(fHigh);
+    if (a != null && b != null) return { cents: Math.round((a + b) / 2), field: `avg(${fLow}, ${fHigh})` };
+    return single(fLow, fHigh);
+  };
+
   const { condition, grading_company, grade } = item;
-  if (condition !== 'graded') return ['loose-price'];
+  if (condition !== 'graded') return single('loose-price');
 
   const g = parseFloat(grade);
-  if (isNaN(g)) return ['graded-price', 'cib-price']; // graded, but grade unknown
+  if (isNaN(g)) return single('graded-price', 'cib-price'); // graded, but grade unknown
 
-  const co = (grading_company ?? 'PSA').toUpperCase();
-  if (g >= 10) return ['condition-17-price', 'graded-price'];   // PSA/BGS/SGC 10
-  const gradedCutoff = co === 'PSA' ? 9 : 9.5;                  // PSA 9 ≈ BGS 9.5
-  if (g >= gradedCutoff) return ['graded-price'];
-  if (g >= 8) return ['cib-price'];                             // PSA 8 ≈ BGS 9
-  return ['loose-price'];                                       // low-grade slabs ≈ raw floor
+  const isBgs = ['BGS', 'BECKETT'].includes((grading_company ?? 'PSA').toUpperCase());
+
+  if (g >= 10)  return single('condition-17-price', 'condition-18-price', 'graded-price');
+  if (g >= 9.5) return isBgs ? single('graded-price')                  // BGS 9.5 IS the graded tier
+                             : avg('graded-price', 'condition-17-price');
+  if (g >= 9)   return isBgs ? single('cib-price')                     // BGS 9 ≈ PSA 8 tier
+                             : single('graded-price');
+  if (g >= 8.5) return avg('cib-price', 'graded-price');
+  if (g >= 8)   return single('cib-price');
+  if (g >= 7.5) return avg('loose-price', 'cib-price');
+  return single('loose-price');                                        // 7 and below ≈ raw floor
 }
 
 // Image-field candidates seen across PriceCharting/SportsCardsPro product
@@ -865,19 +896,14 @@ async function pcLookupOnBase(baseUrl, item, token) {
         }
       }
 
-      // Grade-aware field chain — first field with a positive value wins.
-      // Values are cents; 0 means "no price recorded".
-      const fields = pcPriceFields(item);
-      let cents = null;
-      let field = null;
-      for (const f of fields) {
-        if (product[f] > 0) { cents = product[f]; field = f; break; }
-      }
-
-      if (cents == null) {
-        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? '?'}) has no ${fields.join(' / ')} value — skipping`);
+      // Grade-aware price selection — half grades interpolate between the two
+      // surrounding tier prices.  Values are cents; 0 means "no price recorded".
+      const priced = pcPriceForGrade(product, item);
+      if (priced == null) {
+        console.log(`[pricecharting] ${tryTag}: "${product['product-name']}" (${product['console-name'] ?? best['console-name'] ?? '?'}) has no usable price for ${item.grading_company ?? ''} ${item.grade ?? item.condition ?? 'raw'} — skipping`);
         continue;
       }
+      const { cents, field } = priced;
 
       const price = parseFloat((cents / 100).toFixed(2));
       const image = await pcProductImage(product);
@@ -1031,6 +1057,6 @@ async function priceSingleItem(catalogId, condition, grade) {
 
 module.exports = {
   runEbayJob, ebaySearch, priceSingleItem, fetchActiveListings,
-  buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceFields,
+  buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
   PC_BASES, PC_JUNK_CONSOLE_RE,
 };

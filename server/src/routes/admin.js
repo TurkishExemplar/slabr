@@ -2,7 +2,7 @@ const express = require('express');
 const pool    = require('../db');
 const {
   runEbayJob, priceSingleItem, fetchPriceCharting,
-  scorePcProduct, buildPcQueries, pcPriceFields, PC_BASES, PC_JUNK_CONSOLE_RE,
+  scorePcProduct, buildPcQueries, pcPriceForGrade, PC_BASES, PC_JUNK_CONSOLE_RE,
 } = require('../jobs/ebay');
 
 const router = express.Router();
@@ -103,9 +103,7 @@ router.get('/test-pricecharting', async (req, res) => {
   const condition       = req.query.condition === 'graded' ? 'graded' : 'raw';
   const grading_company = (req.query.grading_company ?? '').trim() || null;
   const grade           = (req.query.grade           ?? '').trim() || null;
-
-  // Grade-aware price-field chain (mirrors fetchPriceCharting exactly)
-  const priceFields = pcPriceFields({ condition, grading_company, grade });
+  const gradeItem       = { condition, grading_company, grade };
 
   // Token info for debugging (never expose the full token)
   const tokenInfo = {
@@ -236,12 +234,11 @@ router.get('/test-pricecharting', async (req, res) => {
 
         const product = (priceData && priceData.status === 'success') ? priceData : best;
 
-        // Grade-aware field chain — first field with a positive value wins
-        let cents = null;
-        let selectedField = null;
-        for (const f of priceFields) {
-          if (product[f] > 0) { cents = product[f]; selectedField = f; break; }
-        }
+        // Grade-aware price selection (mirrors fetchPriceCharting exactly) —
+        // half grades interpolate between the two surrounding tier prices
+        const priced        = pcPriceForGrade(product, gradeItem);
+        const cents         = priced?.cents ?? null;
+        const selectedField = priced?.field ?? null;
 
         // Image-field probe (mirrors pcProductImage candidates, minus the CDN
         // HEAD check) so production responses reveal what the API exposes.
@@ -259,7 +256,6 @@ router.get('/test-pricecharting', async (req, res) => {
           product_name:     product['product-name']  ?? best['product-name'],
           console_name:     product['console-name']  ?? best['console-name'] ?? null,
           console_score:    scored[0].score,
-          price_field_chain: priceFields,
           selected_field:   selectedField,
           loose_price:        (product['loose-price']        ?? 0) / 100,
           cib_price:          (product['cib-price']          ?? 0) / 100,
