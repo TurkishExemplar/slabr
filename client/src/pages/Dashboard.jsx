@@ -6,6 +6,7 @@ import {
 } from 'recharts';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../lib/api';
+import { blendIfLightBackground } from '../lib/imageBlend';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -632,7 +633,7 @@ function ItemCard({ item }) {
               src={item.image_url}
               alt={item.name}
               loading="lazy"
-              onLoad={() => setImgLoaded(true)}
+              onLoad={e => { setImgLoaded(true); blendIfLightBackground(e.currentTarget); }}
               // Unverified CDN guesses can 404 — hide the image and stop the
               // loading pulse, leaving the plain zinc tile
               onError={e => { e.currentTarget.style.display = 'none'; setImgLoaded(true); }}

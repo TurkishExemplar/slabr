@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../lib/api';
@@ -17,6 +17,11 @@ const CATEGORY_LABELS = {
 };
 
 const GRADING_COMPANIES = ['PSA', 'BGS', 'CGC', 'SGC', 'CSG', 'HGA'];
+
+const pillCls = active =>
+  `text-[11px] px-2.5 py-1 rounded-full border transition ${active
+    ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
+    : 'border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'}`;
 
 // Grade ladders per company — BGS/CGC use half grades, PSA/SGC mostly whole.
 // Companies without a specific ladder get the generic half-step scale.
@@ -78,6 +83,13 @@ export default function Add() {
   const [query, setQuery]                 = useState('');
   const [results, setResults]             = useState([]);
   const [searching, setSearching]         = useState(false);
+  const [suggestion, setSuggestion]       = useState(null);
+
+  // Search filter pills + sort
+  const [searchCategory, setSearchCategory]   = useState('all');
+  const [searchSport, setSearchSport]         = useState('all');
+  const [searchCondition, setSearchCondition] = useState('all');
+  const [searchSort, setSearchSort]           = useState('high');
   const [registeringId, setRegisteringId] = useState(null); // ebay_item_id being registered
   const [selectedItem, setSelectedItem]   = useState(null);
   const [panelOpen, setPanelOpen]         = useState(false);
@@ -212,13 +224,20 @@ export default function Add() {
   // results of a newer query.
   useEffect(() => {
     const q = query.trim();
-    if (!q) { setResults([]); setManualMode(false); return; }
+    if (!q) { setResults([]); setSuggestion(null); setManualMode(false); return; }
     setSearching(true);
     const ctrl = new AbortController();
     const t = setTimeout(async () => {
       try {
-        const res = await fetch(`${API}/api/catalog/search?q=${encodeURIComponent(q)}`, { signal: ctrl.signal });
-        setResults(await res.json());
+        const params = new URLSearchParams({ q });
+        if (searchCategory !== 'all') params.set('category', searchCategory);
+        if (searchCategory === 'sports' && searchSport !== 'all') params.set('sport', searchSport);
+        if (searchCondition !== 'all') params.set('condition', searchCondition);
+        const res = await fetch(`${API}/api/catalog/search?${params}`, { signal: ctrl.signal });
+        const data = await res.json();
+        // Plain array on hits; { results, suggestion } when empty
+        setResults(Array.isArray(data) ? data : (data.results ?? []));
+        setSuggestion(Array.isArray(data) ? null : (data.suggestion ?? null));
       } catch (err) {
         if (err.name !== 'AbortError') setResults([]);
       } finally {
@@ -226,7 +245,19 @@ export default function Add() {
       }
     }, 350);
     return () => { clearTimeout(t); ctrl.abort(); };
-  }, [query]);
+  }, [query, searchCategory, searchSport, searchCondition]);
+
+  // Sorted view of the results — local (already-saved) entries stay pinned on
+  // top; SCP results sort by reference price.
+  const sortedResults = useMemo(() => {
+    if (searchSort === 'relevant') return results;
+    const locals = results.filter(r => r.source === 'local');
+    const rest   = results.filter(r => r.source !== 'local').sort((a, b) =>
+      searchSort === 'high'
+        ? (b.current_value ?? 0) - (a.current_value ?? 0)
+        : (a.current_value ?? 0) - (b.current_value ?? 0));
+    return [...locals, ...rest];
+  }, [results, searchSort]);
 
   // ── Open add-panel ───────────────────────────────────────────────────────
   // For SportsCardsPro results: first upsert into master_catalog to get a real
@@ -423,10 +454,42 @@ export default function Add() {
               )}
             </div>
 
+            {/* Filter + sort pills */}
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {[['all', 'All'], ['sports', 'Sports'], ['tcg', 'TCG'], ['comics', 'Comics'], ['sealed', 'Sealed']].map(([v, l]) => (
+                  <button key={v} onClick={() => { setSearchCategory(v); if (v !== 'sports') setSearchSport('all'); }} className={pillCls(searchCategory === v)}>
+                    {l}
+                  </button>
+                ))}
+                <span className="w-px h-4 bg-zinc-800 mx-1" />
+                {[['all', 'Any condition'], ['graded', 'Graded'], ['raw', 'Raw']].map(([v, l]) => (
+                  <button key={v} onClick={() => setSearchCondition(v)} className={pillCls(searchCondition === v)}>
+                    {l}
+                  </button>
+                ))}
+                <span className="w-px h-4 bg-zinc-800 mx-1" />
+                {[['high', '$ High→Low'], ['low', '$ Low→High'], ['relevant', 'Most Relevant']].map(([v, l]) => (
+                  <button key={v} onClick={() => setSearchSort(v)} className={pillCls(searchSort === v)}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+              {searchCategory === 'sports' && (
+                <div className="flex flex-wrap gap-1.5">
+                  {[['all', 'All sports'], ['basketball', 'Basketball'], ['football', 'Football'], ['baseball', 'Baseball'], ['hockey', 'Hockey'], ['soccer', 'Soccer']].map(([v, l]) => (
+                    <button key={v} onClick={() => setSearchSport(v)} className={pillCls(searchSport === v)}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* Results */}
             {results.length > 0 && !manualMode && (
               <div className="space-y-2">
-                {results.map(item => {
+                {sortedResults.map(item => {
                   const key = item.source === 'scp' ? item.ebay_item_id : String(item.id);
                   const isRegistering = registeringId === item.ebay_item_id;
                   const price = fmt(item.current_value);
@@ -498,10 +561,18 @@ export default function Add() {
               </div>
             )}
 
-            {/* No results → offer manual add */}
+            {/* No results → suggestion + manual add */}
             {query.trim() && !searching && results.length === 0 && !manualMode && (
               <div className="text-center py-12">
                 <p className="text-zinc-500 text-sm mb-4">No results for "{query}"</p>
+                {suggestion && (
+                  <button
+                    onClick={() => setQuery(suggestion)}
+                    className="block mx-auto mb-4 text-sm text-indigo-400 hover:text-indigo-300 transition"
+                  >
+                    Did you mean “{suggestion}”?
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     setManualMode(true);

@@ -1,22 +1,11 @@
 const express = require('express');
 const pool = require('../db');
-const { fetchActiveListings, buildQuery, titleMatchesCompany } = require('../jobs/ebay');
+const {
+  fetchActiveListings, buildQuery, titleMatchesCompany,
+  getItemComps, pcTierLabelFor,
+} = require('../jobs/ebay');
 
 const router = express.Router();
-
-// Map an item's (condition, grading_company, grade) to its PriceCharting tier
-// label.  Half grades have no tier of their own — they bucket to the floor
-// grade for sold-listing lookups (a BGS 8.5 shops in the Grade 8 bucket,
-// title-filtered to actual 8.5 slabs).
-function pcTierLabelFor(item) {
-  if (item.condition !== 'graded') return { label: 'Ungraded', halfGrade: false };
-  const g = parseFloat(item.grade);
-  if (isNaN(g))  return { label: 'Grade 9', halfGrade: false };
-  if (g >= 10)   return { label: 'PSA 10', halfGrade: false };
-  if (g === 9.5) return { label: 'Grade 9.5', halfGrade: false };
-  if (g % 1 !== 0) return { label: `Grade ${Math.floor(g)}`, halfGrade: true };
-  return { label: `Grade ${g}`, halfGrade: false };
-}
 
 // Shared SELECT fragment for portfolio items
 const ITEM_SELECT = `
@@ -335,28 +324,6 @@ router.get('/:id/market', async (req, res) => {
       (historyByGrade[r.grade_label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
     }
 
-    // ── Grade price table: current, ~30d change, 90d volume ──────────────
-    const { rows: vol } = await pool.query(`
-      SELECT grade_label, COUNT(*)::int AS n
-      FROM pc_sales
-      WHERE catalog_id = $1 AND sold_date > NOW() - INTERVAL '90 days'
-      GROUP BY grade_label
-    `, [item.catalog_id]);
-    const volumeByLabel = Object.fromEntries(vol.map(v => [v.grade_label, v.n]));
-
-    const gradePrices = Object.entries(historyByGrade).map(([label, series]) => {
-      const current = series[series.length - 1];
-      const cutoff  = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
-      const past    = [...series].reverse().find(p => p.date <= cutoff) ?? series[0];
-      return {
-        grade:    label,
-        current:  current.value,
-        change:   past && past !== current ? parseFloat((current.value - past.value).toFixed(2)) : 0,
-        volume_90d: volumeByLabel[label] ?? 0,
-        is_user_grade: label === userSeries,
-      };
-    });
-
     // ── Recent sales per grade (for the chart's grade selector) ──────────
     const { rows: allSales } = await pool.query(`
       SELECT date, grade_label, price, title, url FROM (
@@ -381,46 +348,82 @@ router.get('/:id/market', async (req, res) => {
       (salesByGrade[s.grade_label] ??= []).push({ ...s, price: parseFloat(s.price) });
     }
 
-    // ── Sold listings for the user's bucket ──────────────────────────────
-    const { rows: bucketSales } = await pool.query(`
-      SELECT sold_date::text AS date, grade_label, price, title, url
-      FROM pc_sales
-      WHERE catalog_id = $1 AND grade_label = $2
-      ORDER BY sold_date DESC
-      LIMIT 60
-    `, [item.catalog_id, userLabel]);
-
-    // Strict company filter first: PSA cards only comp against PSA listings,
-    // raw cards exclude every graded listing.  (Graded items with no known
-    // company can't be filtered and keep the whole bucket.)
-    let sales = bucketSales;
-    if (item.condition !== 'graded') {
-      sales = bucketSales.filter(s => titleMatchesCompany(s.title, null));
-    } else if (item.grading_company) {
-      sales = bucketSales.filter(s => titleMatchesCompany(s.title, item.grading_company));
-    }
-
-    let salesFiltered = false;
-    if (halfGrade && item.grading_company) {
-      // e.g. BGS 8.5: only actual 8.5 slabs from the Grade 8 bucket.
-      // When no listing title carries the exact half grade, fall back to the
-      // company-filtered bucket — sales_filtered tells the UI which it got.
-      const esc = String(item.grade).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re  = new RegExp(`${item.grading_company}\\s*-?\\s*${esc}(?![0-9])`, 'i');
-      const filtered = sales.filter(s => re.test(s.title ?? ''));
-      if (filtered.length) {
-        sales = filtered;
-        salesFiltered = true;
+    // Split exact subgrades out of their floor buckets — BGS/SGC/CGC half
+    // grades live inside the whole-grade tables on PC, but deserve their own
+    // selectable series ("Grade 8.5" pill → only 8.5 slabs).
+    if (item.condition === 'graded' && item.grading_company) {
+      for (const half of ['1.5', '2.5', '3.5', '4.5', '5.5', '6.5', '7.5', '8.5']) {
+        const floorLabel = `Grade ${Math.floor(parseFloat(half))}`;
+        const bucket = salesByGrade[floorLabel];
+        if (!bucket?.length) continue;
+        const re = new RegExp(`${item.grading_company}\\s*-?\\s*${half.replace('.', '\\.')}(?![0-9])`, 'i');
+        const exact = bucket.filter(s => re.test(s.title ?? ''));
+        if (exact.length) {
+          salesByGrade[`Grade ${half}`] = exact;
+          salesByGrade[floorLabel] = bucket.filter(s => !exact.includes(s));
+        }
       }
     }
+
+    // Subgrade series + table rows: derive monthly sale-medians for any sales
+    // group that has no chart series yet (mirrors the lower-grade derivation).
+    for (const [label, list] of Object.entries(salesByGrade)) {
+      if (historyByGrade[label] || !list.length) continue;
+      const byMonth = new Map();
+      for (const s of [...list].sort((a, b) => a.date.localeCompare(b.date))) {
+        const month = `${s.date.slice(0, 7)}-01`;
+        if (!byMonth.has(month)) byMonth.set(month, []);
+        byMonth.get(month).push(s.price);
+      }
+      historyByGrade[label] = [...byMonth.entries()].map(([date, prices]) => {
+        const sorted = prices.filter(p => p > 0).sort((a, b) => a - b);
+        return { date, value: sorted[Math.floor(sorted.length / 2)] ?? 0 };
+      }).filter(p => p.value > 0);
+      if (!historyByGrade[label].length) delete historyByGrade[label];
+    }
+
+    // ── Grade price table: current, ~30d change, 90d volume ──────────────
+    // Built AFTER the subgrade split so derived subgrade series get rows too.
+    const { rows: vol } = await pool.query(`
+      SELECT grade_label, COUNT(*)::int AS n
+      FROM pc_sales
+      WHERE catalog_id = $1 AND sold_date > NOW() - INTERVAL '90 days'
+      GROUP BY grade_label
+    `, [item.catalog_id]);
+    const volumeByLabel = Object.fromEntries(vol.map(v => [v.grade_label, v.n]));
+    const cutoff90 = new Date(Date.now() - 90 * 86400_000).toISOString().slice(0, 10);
+
+    const gradePrices = Object.entries(historyByGrade).map(([label, series]) => {
+      const current = series[series.length - 1];
+      const cutoff  = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
+      const past    = [...series].reverse().find(p => p.date <= cutoff) ?? series[0];
+      // Subgrade labels have no pc_sales grade_label of their own — count
+      // their split-out sales instead.
+      const volume = volumeByLabel[label]
+        ?? (salesByGrade[label] ?? []).filter(s => s.date >= cutoff90).length;
+      return {
+        grade:    label,
+        current:  current.value,
+        change:   past && past !== current ? parseFloat((current.value - past.value).toFixed(2)) : 0,
+        volume_90d: volume,
+        is_user_grade: label === userSeries,
+      };
+    });
+
+    // ── Sold listings + sold median for the user's exact grade ───────────
+    // getItemComps is the same helper the pricer uses for the sold median —
+    // the Recent Sales list and the Market Value always come from the exact
+    // same filtered set.
+    const comps = await getItemComps(item.catalog_id, item);
 
     res.json({
       user_tier:        userSeries,
       user_bucket:      userLabel,
       history_by_grade: historyByGrade,
       grade_prices:     gradePrices,
-      sales:            sales.slice(0, 30).map(s => ({ ...s, price: parseFloat(s.price) })),
-      sales_filtered:   salesFiltered,
+      sales:            comps.sales,
+      sales_filtered:   comps.filtered,
+      sales_median:     comps.median,
       sales_by_grade:   salesByGrade,
     });
   } catch (err) {

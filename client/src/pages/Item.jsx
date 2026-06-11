@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../lib/api';
+import { blendIfLightBackground } from '../lib/imageBlend';
 
 function fmt$(n) {
   if (n == null || isNaN(n)) return '—';
@@ -222,7 +223,7 @@ export default function Item() {
     const now = Date.now();
     const cutoff = range === '6M' ? now - 182  * 86400_000 :
                    range === '1Y' ? now - 365  * 86400_000 :
-                   range === '5Y' ? now - 1825 * 86400_000 : null;
+                                    now - 1825 * 86400_000; // 5Y
 
     const rowsByDate = new Map();
     const series = [];
@@ -570,6 +571,8 @@ export default function Item() {
                     // hide the broken image; pricing replaces it with a
                     // verified URL on the next refresh.
                     onError={e => { e.currentTarget.style.display = 'none'; }}
+                    // White-background product shots blend into a light tile
+                    onLoad={e => blendIfLightBackground(e.currentTarget)}
                   />
                 : <ItemIcon type={item.item_type} />
               }
@@ -779,7 +782,7 @@ export default function Item() {
                     </select>
                   )}
                   <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
-                    {['6M', '1Y', '5Y', 'All'].map(r => (
+                    {['6M', '1Y', '5Y'].map(r => (
                       <button
                         key={r}
                         onClick={() => setRange(r)}
@@ -868,7 +871,8 @@ export default function Item() {
                         <tbody>
                           {[...market.grade_prices]
                             .filter(g => resolvedGradeView === 'All' || g.grade === resolvedGradeView)
-                            .sort((a, b) => gradeOrderKey(b.grade) - gradeOrderKey(a.grade))
+                            // Lowest grade first, reading down to PSA 10
+                            .sort((a, b) => gradeOrderKey(a.grade) - gradeOrderKey(b.grade))
                             .map(g => (
                               <tr key={g.grade} className={g.is_user_grade ? 'text-white font-semibold' : 'text-zinc-400'}>
                                 <td className="py-1">
@@ -1025,6 +1029,29 @@ export default function Item() {
                             : ` · ${market.user_bucket} bucket (no exact ${[item.grading_company, item.grade].filter(Boolean).join(' ')} listings)`)
                         : ` · ${market.user_tier}`)}
                 </p>
+                {/* Subgrade pills — half-grade scales (BGS/SGC/CGC) can jump
+                    straight to any subgrade that has sales data */}
+                {['BGS', 'BECKETT', 'SGC', 'CGC'].includes((item.grading_company ?? '').toUpperCase()) &&
+                  Object.keys(market?.sales_by_grade ?? {}).length > 1 && (
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {Object.keys(market.sales_by_grade)
+                      .sort((a, b) => gradeOrderKey(a) - gradeOrderKey(b))
+                      .map(label => (
+                        <button
+                          key={label}
+                          onClick={() => setGradeView(label)}
+                          className={`text-[10px] px-2 py-0.5 rounded-full border transition ${
+                            resolvedGradeView === label
+                              ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
+                              : 'border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                  </div>
+                )}
+
                 {shownSales.length === 0 && (
                   <p className="text-zinc-600 text-sm py-3 text-center">No recorded sales for {resolvedGradeView}</p>
                 )}

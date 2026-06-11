@@ -116,11 +116,28 @@ function buildQuery(item) {
       return [name, set_name, card_number, gradeStr].filter(Boolean).join(' ');
     case 'comic':
       return [name, card_number ? `#${card_number}` : '', brand_publisher, gradeStr].filter(Boolean).join(' ');
-    case 'sealed':
-      return [name, year, sport_game, 'sealed'].filter(Boolean).join(' ');
+    case 'sealed': {
+      // Sealed boxes need the exact product + year + box type + "sealed" —
+      // a bare set name surfaces single packs and opened product.
+      const txt = `${name} ${set_name ?? ''} ${sport_game ?? ''}`;
+      const boxType = /\b(box|case)\b/i.test(`${name} ${set_name ?? ''}`)
+        ? null // product name already says which box it is
+        : (/pokemon|magic|yu-?gi-?oh|lorcana|tcg/i.test(txt) ? 'booster box' : 'hobby box');
+      return [name, year, boxType, 'sealed'].filter(Boolean).join(' ');
+    }
     default:
       return [name, year, set_name].filter(Boolean).join(' ');
   }
+}
+
+// Sealed-box listing junk: single packs, opened/empty boxes, lots.  "pack" is
+// junk only when the title isn't about a box/case (box titles legitimately
+// say "36 packs").
+function isSealedJunkTitle(title) {
+  const t = title ?? '';
+  if (/\b(single|opened|empty|lot|partial|repack)\b/i.test(t)) return true;
+  if (/\bpacks?\b/i.test(t) && !/\b(box|case)\b/i.test(t)) return true;
+  return false;
 }
 
 // ── Grade-aware result filters ────────────────────────────────────────────────
@@ -227,7 +244,9 @@ async function fetchActiveListings(item, limit = 8) {
 
   const raw      = data.itemSummaries ?? [];
   const filtered = filterByGradeTag(raw, gradeFilter)
-    .filter(l => item.item_type === 'sealed' || !LISTING_JUNK_RE.test(l.title ?? ''))
+    .filter(l => item.item_type === 'sealed'
+      ? !isSealedJunkTitle(l.title)
+      : !LISTING_JUNK_RE.test(l.title ?? ''))
     .filter(l => parseFloat(l.price?.value) > 0);
 
   return {
@@ -338,8 +357,8 @@ async function _runEbayJobInner(hasEbay) {
       if (!isOneOfOne) {
         const pc = await fetchPriceCharting(combo);
         if (pc != null) {
-          soldMedian = pc.price;
-          console.log(`[ebay-job] ${combo.name} | PriceCharting market value: $${soldMedian} (${pc.field})`);
+          soldMedian = pc.price; // tier-mapped baseline
+          console.log(`[ebay-job] ${combo.name} | PriceCharting tier value: $${soldMedian} (${pc.field})`);
 
           // Catalog image always comes from PriceCharting — per-user photos
           // live on portfolio_items.custom_image, never here.
@@ -350,8 +369,14 @@ async function _runEbayJobInner(hasEbay) {
             );
           }
 
-          // Sync PC's price history — inserts only dates not yet recorded
+          // Sync sales/history first, then sold median = median of the exact
+          // comps Recent Sales displays (shared getItemComps).
           await syncPcHistory(combo.catalog_id, combo.condition, combo.grade, pc);
+          const comps = await getItemComps(combo.catalog_id, combo);
+          if (comps.count >= 3 && comps.median > 0) {
+            console.log(`[ebay-job] ${combo.name} | sold median from ${comps.count} comps: $${comps.median}`);
+            soldMedian = comps.median;
+          }
         }
       } else {
         skippedOneOfOne++;
@@ -1063,45 +1088,58 @@ function titleMatchesCompany(title, company) {
   return !Object.entries(PC_COMPANY_RES).some(([k, re]) => k !== co && re.test(t));
 }
 
-// Half grades interpolate between tiers, but real comps beat any midpoint:
-// when the product page's sold listings contain enough recent title-matched
-// sales of THIS exact half grade (e.g. "BGS 8.5"), the price becomes their
-// median.  A BGS 8.5 whose comps all sit at Grade-8 money must not be valued
-// halfway to Grade 9.
-async function refineHalfGradeFromSales(result, item) {
+// Map an item's (condition, grading_company, grade) to its PriceCharting tier
+// label.  Half grades have no tier of their own — they bucket to the floor
+// grade for sold-listing lookups (a BGS 8.5 shops in the Grade 8 bucket,
+// title-filtered to actual 8.5 slabs).
+function pcTierLabelFor(item) {
+  if (item.condition !== 'graded') return { label: 'Ungraded', halfGrade: false };
   const g = parseFloat(item.grade);
-  if (!result?.productId) return result;
-  if (item.condition !== 'graded' || isNaN(g) || g % 1 === 0 || !item.grading_company) return result;
-  if (!String(result.field ?? '').includes('avg(')) return result; // exact tiers stay
+  if (isNaN(g))  return { label: 'Grade 9', halfGrade: false };
+  if (g >= 10)   return { label: 'PSA 10', halfGrade: false };
+  if (g === 9.5) return { label: 'Grade 9.5', halfGrade: false };
+  if (g % 1 !== 0) return { label: `Grade ${Math.floor(g)}`, halfGrade: true };
+  return { label: `Grade ${g}`, halfGrade: false };
+}
 
-  try {
-    const page = await fetchPcPage(result.productId);
-    if (!page?.sales?.length) return result;
+// ── THE single source of truth for an item's sold comparables ────────────────
+// Both the Recent Sales display AND the sold-median calculation use this exact
+// query + filter chain, so they can never disagree: bucket by tier, strict
+// grading-company match, exact half-grade title filter (with fallback), 30
+// most recent.  median is computed over precisely the sales that render.
+async function getItemComps(catalogId, item) {
+  const { label: bucket, halfGrade } = pcTierLabelFor(item);
 
-    const bucket = `Grade ${Math.floor(g)}`;
-    const re     = new RegExp(`${item.grading_company}\\s*-?\\s*${escapeRegExp(String(item.grade))}(?![0-9])`, 'i');
-    const cutoff = new Date(Date.now() - 180 * 86400_000).toISOString().slice(0, 10);
+  const { rows } = await pool.query(`
+    SELECT sold_date::text AS date, grade_label, price, title, url
+    FROM pc_sales
+    WHERE catalog_id = $1 AND grade_label = $2
+    ORDER BY sold_date DESC
+    LIMIT 60
+  `, [catalogId, bucket]);
 
-    const comps = page.sales
-      .filter(s => s.gradeLabel === bucket && s.date >= cutoff && s.price > 0
-        && re.test(s.title ?? '')
-        && titleMatchesCompany(s.title, item.grading_company))
-      .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, 10);
-    if (comps.length < 3) return result; // too thin — keep the interpolation
-
-    const sorted = comps.map(s => s.price).sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
-    console.log(`[pricecharting] half-grade comps: median of ${comps.length} recent ${item.grading_company} ${item.grade} sales = $${median} (interpolation said $${result.price})`);
-    return {
-      ...result,
-      price: parseFloat(median.toFixed(2)),
-      field: `median of ${comps.length} recent ${item.grading_company} ${item.grade} sales`,
-    };
-  } catch (err) {
-    console.warn(`[pricecharting] half-grade comp refinement failed: ${err.message}`);
-    return result;
+  let sales = rows;
+  if (item.condition !== 'graded') {
+    sales = sales.filter(s => titleMatchesCompany(s.title, null));
+  } else if (item.grading_company) {
+    sales = sales.filter(s => titleMatchesCompany(s.title, item.grading_company));
   }
+
+  let filtered = false;
+  if (halfGrade && item.grading_company) {
+    const re = new RegExp(`${item.grading_company}\\s*-?\\s*${escapeRegExp(String(item.grade))}(?![0-9])`, 'i');
+    const exact = sales.filter(s => re.test(s.title ?? ''));
+    if (exact.length) {
+      sales = exact;
+      filtered = true;
+    }
+  }
+
+  sales = sales.slice(0, 30).map(s => ({ ...s, price: parseFloat(s.price) }));
+  const prices = sales.map(s => s.price).filter(p => p > 0).sort((a, b) => a - b);
+  const median = prices.length ? prices[Math.floor(prices.length / 2)] : null;
+
+  return { bucket, halfGrade, sales, filtered, median, count: prices.length };
 }
 
 async function fetchPriceCharting(item) {
@@ -1111,7 +1149,7 @@ async function fetchPriceCharting(item) {
   // sportscardspro.com first; pricecharting.com only when it yields nothing.
   for (const baseUrl of PC_BASES) {
     const result = await pcLookupOnBase(baseUrl, item, token);
-    if (result != null) return refineHalfGradeFromSales(result, item);
+    if (result != null) return result;
   }
 
   console.log('[pricecharting] all domains and query variations exhausted — no usable price');
@@ -1364,8 +1402,8 @@ async function priceSingleItem(catalogId, condition, grade) {
     // active-listing source, not a sold-price source.
     const pc = await fetchPriceCharting(catalogRow);
     if (pc != null) {
-      soldMedian = pc.price;
-      console.log(`[pricing] PriceCharting market value: $${soldMedian} (${pc.field})`);
+      soldMedian = pc.price; // tier-mapped baseline
+      console.log(`[pricing] PriceCharting tier value: $${soldMedian} (${pc.field})`);
 
       // Catalog image always comes from PriceCharting — per-user photos live
       // on portfolio_items.custom_image, never here.
@@ -1377,9 +1415,18 @@ async function priceSingleItem(catalogId, condition, grade) {
         console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}: ${pc.image}`);
       }
 
-      // Sync PC's price history so the chart shows everything PC exposes —
-      // inserts only dates not yet recorded.
+      // Sync sales/history FIRST so the comps below read fresh data.
       await syncPcHistory(catalogId, condition, grade, pc);
+
+      // Sold median = median of the EXACT comps the Recent Sales section
+      // displays (getItemComps is shared with the /market endpoint), so the
+      // two can never disagree.  Tier value remains the fallback for thin
+      // markets (< 3 comps).
+      const comps = await getItemComps(catalogId, catalogRow);
+      if (comps.count >= 3 && comps.median > 0) {
+        console.log(`[pricing] sold median from ${comps.count} displayed comps: $${comps.median} (tier said $${pc.price})`);
+        soldMedian = comps.median;
+      }
     }
   }
 
@@ -1485,17 +1532,45 @@ function scpParseConsole(consoleName) {
   return { year, sport, set_name: set || null };
 }
 
+// Normalize a user query for SCP's literal search: lowercase, strip special
+// characters, collapse whitespace.
+function normalizeScpQuery(q) {
+  return String(q ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9#/.\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Returns results mapped to the catalog shape the /add page expects.
 // The SCP product id is stored in ebay_item_id (reused column) so future
 // lookups can reference the exact product.
-async function scpSearch(query, limit = 8) {
+//
+// opts.category: 'sports' | 'tcg' | 'comics' | 'sealed' — result filter
+// opts.sport:    'basketball' | … — appended to the query and result-filtered
+// opts.condition:'graded' | 'raw' — keeps only products with that price data
+//
+// Long queries that return nothing retry with fewer words (first 2, then 1) —
+// SCP's search is literal and over-specific queries silently miss.
+async function scpSearch(query, limit = 8, opts = {}) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
   if (!token) return [];
   const tEnc = encodeURIComponent(token);
 
+  const norm  = normalizeScpQuery(query);
+  if (!norm) return [];
+  const words = norm.split(' ');
+  const attempts = [...new Set([
+    opts.sport && !norm.includes(opts.sport) ? `${norm} ${opts.sport}` : null,
+    norm,
+    words.length >= 3 ? words.slice(0, 2).join(' ') : null,
+    words.length >= 2 ? words[0] : null,
+  ].filter(Boolean))];
+
   for (const baseUrl of PC_BASES) {
+    for (const attempt of attempts) {
     try {
-      const resp = await fetch(`${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(query)}`, { signal: AbortSignal.timeout(10_000) });
+      const resp = await fetch(`${baseUrl}/api/products?t=${tEnc}&q=${encodeURIComponent(attempt)}`, { signal: AbortSignal.timeout(10_000) });
       if (!resp.ok) continue;
       const data = await resp.json().catch(() => null);
       if (!data || data.status !== 'success' || !data.products?.length) continue;
@@ -1556,14 +1631,31 @@ async function scpSearch(query, limit = 8) {
           image_url,
           current_value: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
           condition:     null,
+          has_graded:    product['graded-price'] > 0,
+          has_loose:     product['loose-price']  > 0,
         };
       }));
 
-      console.log(`[scp-search] "${query}" → ${enriched.length} result(s) via ${new URL(baseUrl).hostname}`);
-      enriched.forEach(e => console.log(`[scp-search]   "${e.name}" image: ${e.image_url ?? 'none'}`));
-      return enriched;
+      // Apply the /add page filters
+      let results = enriched;
+      if (opts.category === 'sports') results = results.filter(r => r.item_type === 'sports_card');
+      if (opts.category === 'tcg')    results = results.filter(r => r.item_type === 'tcg');
+      if (opts.category === 'comics') results = results.filter(r => r.item_type === 'comic');
+      if (opts.category === 'sealed') results = results.filter(r => /\b(box|case|bundle|tin|etb)\b/i.test(r.name));
+      if (opts.sport) {
+        results = results.filter(r => (r.sport_game ?? '').toLowerCase().includes(opts.sport));
+      }
+      if (opts.condition === 'graded') results = results.filter(r => r.has_graded);
+      if (opts.condition === 'raw')    results = results.filter(r => r.has_loose);
+
+      if (!results.length) continue; // filters emptied this attempt — broaden
+
+      console.log(`[scp-search] "${attempt}" → ${results.length} result(s) via ${new URL(baseUrl).hostname}`);
+      results.forEach(e => console.log(`[scp-search]   "${e.name}" image: ${e.image_url ?? 'none'}`));
+      return results;
     } catch (err) {
-      console.error(`[scp-search] ${baseUrl} error: ${err.message}`);
+      console.error(`[scp-search] ${baseUrl} "${attempt}" error: ${err.message}`);
+    }
     }
   }
 
@@ -1575,5 +1667,6 @@ module.exports = {
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
   extractPcHistoryPoints, fetchPcPriceHistory, parsePcPage, fetchPcPage,
   backfillPcHistory, upsertPcSales, titleMatchesCompany,
+  getItemComps, pcTierLabelFor,
   PC_BASES, PC_JUNK_CONSOLE_RE, PC_TIERS,
 };

@@ -13,66 +13,60 @@ router.get('/search', async (req, res) => {
   const q = (req.query.q ?? '').trim();
   if (!q) return res.json([]);
 
+  // Filter pills from the /add page
+  const opts = {
+    category:  ['sports', 'tcg', 'comics', 'sealed'].includes(req.query.category) ? req.query.category : null,
+    sport:     (req.query.sport ?? '').toLowerCase().trim() || null,
+    condition: ['graded', 'raw'].includes(req.query.condition) ? req.query.condition : null,
+  };
+
+  // Fuzzy local matching: every word must match SOME field (not the exact
+  // phrase), so "jordan fleer" finds "Michael Jordan … 1986-87 Fleer".
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 5);
+  const wordConds = words
+    .map((_, i) => `(name ILIKE $${i + 1} OR set_name ILIKE $${i + 1} OR brand_publisher ILIKE $${i + 1} OR sport_game ILIKE $${i + 1})`)
+    .join(' AND ');
+  const wordParams = words.map(w => `%${w}%`);
+  const localQuery = pool.query(`
+    SELECT id, item_type, name, year, brand_publisher, set_name,
+           card_number, variation, sport_game, rarity, image_url
+    FROM master_catalog
+    WHERE ${wordConds}
+    ORDER BY name
+    LIMIT 10
+  `, wordParams);
+
   const hasScp = !!(process.env.PRICE_CHARTING_TOKEN ?? '').trim();
 
-  if (hasScp) {
-    try {
-      const { scpSearch } = require('../jobs/ebay');
-
-      // Run SCP search and local catalog lookup in parallel.
-      // Local results take priority — if a card already exists in master_catalog
-      // we show that version so the user adds to the existing catalog entry
-      // rather than creating a duplicate.
-      const [scpItems, localRes] = await Promise.all([
-        scpSearch(q, 12),
-        pool.query(`
-          SELECT id, item_type, name, year, brand_publisher, set_name,
-                 card_number, variation, sport_game, rarity, image_url
-          FROM master_catalog
-          WHERE name           ILIKE $1
-             OR set_name        ILIKE $1
-             OR brand_publisher ILIKE $1
-          ORDER BY name
-          LIMIT 10
-        `, [`%${q}%`]),
-      ]);
-
-      const local = localRes.rows.map(r => ({ ...r, source: 'local' }));
-
-      // Suppress SCP results whose 40-char name prefix matches a local entry —
-      // the user sees the saved version instead of creating a duplicate.
-      const localKeys = new Set(
-        local.map(r => (r.name ?? '').toLowerCase().slice(0, 40))
-      );
-      const freshScp = scpItems.filter(s =>
-        !localKeys.has((s.name ?? '').toLowerCase().slice(0, 40))
-      );
-
-      // Local entries first so the user sees familiar/saved cards at the top.
-      const merged = [...local, ...freshScp].slice(0, 25);
-      if (merged.length) return res.json(merged);
-      // Nothing from SCP or the targeted local query — fall through to the
-      // broader local search below.
-    } catch (err) {
-      console.error('[catalog search] SportsCardsPro error, falling back to local:', err.message);
-      // fall through to local search
-    }
-  }
-
-  // ── Local ILIKE fallback ──────────────────────────────────────────────────
   try {
-    const { rows } = await pool.query(`
-      SELECT id, item_type, name, year, brand_publisher, set_name,
-             card_number, variation, sport_game, rarity, image_url
-      FROM master_catalog
-      WHERE name           ILIKE $1
-         OR set_name        ILIKE $1
-         OR brand_publisher ILIKE $1
-         OR sport_game      ILIKE $1
-      ORDER BY name
-      LIMIT 25
-    `, [`%${q}%`]);
-    res.json(rows.map(r => ({ ...r, source: 'local' })));
+    const { scpSearch } = require('../jobs/ebay');
+    const [scpItems, localRes] = await Promise.all([
+      hasScp ? scpSearch(q, 12, opts) : Promise.resolve([]),
+      localQuery,
+    ]);
+
+    const local = localRes.rows.map(r => ({ ...r, source: 'local' }));
+
+    // Suppress SCP results whose 40-char name prefix matches a local entry —
+    // the user sees the saved version instead of creating a duplicate.
+    const localKeys = new Set(
+      local.map(r => (r.name ?? '').toLowerCase().slice(0, 40))
+    );
+    const freshScp = scpItems.filter(s =>
+      !localKeys.has((s.name ?? '').toLowerCase().slice(0, 40))
+    );
+
+    // Local entries first so the user sees familiar/saved cards at the top.
+    const merged = [...local, ...freshScp].slice(0, 25);
+    if (merged.length) return res.json(merged);
+
+    // Nothing anywhere — offer a "did you mean" from the closest local name
+    // matching the first word.
+    const { rows: close } = await pool.query(
+      `SELECT name FROM master_catalog WHERE name ILIKE $1 ORDER BY LENGTH(name) LIMIT 1`,
+      [`%${words[0] ?? q}%`]
+    );
+    return res.json({ results: [], suggestion: close[0]?.name ?? null });
   } catch (err) {
     console.error('[catalog search]', err.message);
     res.status(500).json({ error: 'Server error' });
