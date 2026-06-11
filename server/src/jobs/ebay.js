@@ -351,8 +351,8 @@ async function _runEbayJobInner(hasEbay) {
             );
           }
 
-          // One-time historic backfill per combo (no-op once history exists)
-          await maybeBackfillPcHistory(combo.catalog_id, combo.condition, combo.grade, pc);
+          // Sync PC's price history — inserts only dates not yet recorded
+          await syncPcHistory(combo.catalog_id, combo.condition, combo.grade, pc);
         }
       } else {
         skippedOneOfOne++;
@@ -933,7 +933,7 @@ const PC_PRICE_KEYS = ['price', 'sale-price', 'sold-price', 'close-price', 'amou
 
 // Scan a response object for the first array whose entries carry a date and a
 // price.  Returns [{date: 'YYYY-MM-DD', cents}] — one point per day (last
-// sale of the day wins), capped to the most recent 120 days.
+// sale of the day wins), unlimited range: everything PC exposes is kept.
 function extractPcHistoryPoints(data) {
   if (!data || typeof data !== 'object') return [];
   // A bare top-level array is the most natural shape for a sales endpoint
@@ -970,7 +970,7 @@ function extractPcHistoryPoints(data) {
       for (const pt of points.sort((a, b) => a.date.localeCompare(b.date))) {
         byDay.set(pt.date, pt.cents);
       }
-      return [...byDay.entries()].map(([date, cents]) => ({ date, cents })).slice(-120);
+      return [...byDay.entries()].map(([date, cents]) => ({ date, cents }));
     }
   }
   return [];
@@ -980,23 +980,35 @@ async function fetchPcPriceHistory(baseUrl, productId, token) {
   const tEnc = encodeURIComponent(token);
   const idEnc = encodeURIComponent(productId);
   const candidates = [
+    `${baseUrl}/api/product/history?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/product/prices?t=${tEnc}&id=${idEnc}`,
+    `${baseUrl}/api/prices?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/sales?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/product?t=${tEnc}&id=${idEnc}&country=US`,
   ];
 
   for (const url of candidates) {
+    const masked = url.replace(tEnc, '***');
     try {
       const resp = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      const text = await resp.text();
+      // Verbose by design: these endpoints are undocumented, and the raw
+      // bodies in the Railway logs are how we learn what history PC exposes.
+      console.log(`[pricecharting] history probe ${masked} → HTTP ${resp.status}: ${text.slice(0, 600)}`);
       if (!resp.ok) continue;
-      const data = await resp.json().catch(() => null);
+
+      let data = null;
+      try { data = JSON.parse(text); } catch (_) { continue; }
       if (!data || data.status === 'error') continue;
+
       const points = extractPcHistoryPoints(data);
       if (points.length) {
-        console.log(`[pricecharting] history: ${points.length} daily points via ${url.replace(tEnc, '***')}`);
+        console.log(`[pricecharting] history: ${points.length} daily points via ${masked}`);
         return points;
       }
-    } catch (_) { /* try next candidate */ }
+    } catch (err) {
+      console.log(`[pricecharting] history probe ${masked} → ${err.message}`);
+    }
   }
 
   console.log(`[pricecharting] history: no candidate endpoint returned parseable points for id=${productId}`);
@@ -1037,21 +1049,13 @@ async function backfillPcHistory(catalogId, condition, grade, points, todayPrice
   return inserted;
 }
 
-// One-time-per-combo history backfill: only runs while the combo has fewer
-// than 2 pricecharting rows (i.e. right after its first successful match).
-async function maybeBackfillPcHistory(catalogId, condition, grade, pc) {
+// History sync — runs on EVERY price refresh.  Idempotent: backfillPcHistory
+// only inserts dates that don't already have a pricecharting row, so repeat
+// runs just pick up whatever new points PC has published since last time.
+async function syncPcHistory(catalogId, condition, grade, pc) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
   if (!pc?.productId || !pc?.baseUrl || !token) return;
   try {
-    const { rows } = await pool.query(`
-      SELECT COUNT(*)::int AS n FROM price_history
-      WHERE catalog_id = $1
-        AND condition IS NOT DISTINCT FROM $2
-        AND grade     IS NOT DISTINCT FROM $3
-        AND source = 'pricecharting'
-    `, [catalogId, condition, grade]);
-    if (rows[0].n >= 2) return; // already has history — daily cron extends it
-
     const points = await fetchPcPriceHistory(pc.baseUrl, pc.productId, token);
 
     // Sanity-band width depends on how much the history can be trusted to be
@@ -1141,9 +1145,9 @@ async function priceSingleItem(catalogId, condition, grade) {
         console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}`);
       }
 
-      // First match for this combo also backfills PC's historic prices so the
-      // chart shows weeks of real data instead of starting from today.
-      await maybeBackfillPcHistory(catalogId, condition, grade, pc);
+      // Sync PC's price history so the chart shows everything PC exposes —
+      // inserts only dates not yet recorded.
+      await syncPcHistory(catalogId, condition, grade, pc);
     }
   }
 
@@ -1271,7 +1275,7 @@ async function scpSearch(query, limit = 8) {
       if (!candidates.length) continue;
 
       // Enrich with prices + image via the per-product endpoint (parallel)
-      const enriched = await Promise.all(candidates.map(async p => {
+      const enriched = await Promise.all(candidates.map(async (p, idx) => {
         let product = p;
         try {
           const r = await fetch(`${baseUrl}/api/product?t=${tEnc}&id=${encodeURIComponent(p.id)}`, { signal: AbortSignal.timeout(10_000) });
@@ -1280,6 +1284,12 @@ async function scpSearch(query, limit = 8) {
             if (d?.status === 'success') product = d;
           }
         } catch (_) { /* keep search-result fields */ }
+
+        // One full response per search — shows exactly which fields (image,
+        // history, condition prices) the API exposes on this plan.
+        if (idx === 0) {
+          console.log(`[scp-search] sample product response: ${JSON.stringify(product).slice(0, 1200)}`);
+        }
 
         const consoleName = product['console-name'] ?? p['console-name'] ?? '';
         const productName = product['product-name'] ?? p['product-name'] ?? '';
@@ -1294,24 +1304,31 @@ async function scpSearch(query, limit = 8) {
         const cents = (product['loose-price']  > 0 ? product['loose-price']  : null)
                    ?? (product['graded-price'] > 0 ? product['graded-price'] : null);
 
+        // Image: explicit API field first; otherwise the predictable CDN path
+        // UNVERIFIED (no HEAD probe — typeahead latency matters more).  The
+        // client hides broken guesses via onError, and pricing saves a
+        // verified image minutes later.
+        const productId = String(product.id ?? p.id);
+        const image_url = (await pcProductImage(product, { cdnFallback: false }))
+          ?? `https://commondatastorage.googleapis.com/images.pricecharting.com/${productId}/1600.jpg`;
+
         return {
           source:        'scp',
-          ebay_item_id:  String(product.id ?? p.id),
+          ebay_item_id:  productId,
           name:          productName,
           item_type:     scpInferItemType(consoleName),
           year,
           set_name,
           card_number:   cnMatch?.[1] ?? null,
           sport_game:    product.genre ?? sport,
-          // No CDN HEAD probe here — typeahead latency matters more than a
-          // guaranteed thumbnail; the real image is saved at pricing time.
-          image_url:     await pcProductImage(product, { cdnFallback: false }),
+          image_url,
           current_value: cents != null ? parseFloat((cents / 100).toFixed(2)) : null,
           condition:     null,
         };
       }));
 
       console.log(`[scp-search] "${query}" → ${enriched.length} result(s) via ${new URL(baseUrl).hostname}`);
+      enriched.forEach(e => console.log(`[scp-search]   "${e.name}" image: ${e.image_url ?? 'none'}`));
       return enriched;
     } catch (err) {
       console.error(`[scp-search] ${baseUrl} error: ${err.message}`);

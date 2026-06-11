@@ -629,6 +629,9 @@ function ItemCard({ item }) {
               alt={item.name}
               loading="lazy"
               onLoad={() => setImgLoaded(true)}
+              // Unverified CDN guesses can 404 — hide the image and stop the
+              // loading pulse, leaving the plain zinc tile
+              onError={e => { e.currentTarget.style.display = 'none'; setImgLoaded(true); }}
               className={`w-full h-full object-contain p-4 transition-opacity duration-300 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
             />
           </>

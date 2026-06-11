@@ -58,7 +58,7 @@ export default function Item() {
   const [item, setItem]                     = useState(null);
   const [priceHistory, setPriceHistory]     = useState([]);
   const [comparableSales, setComparableSales] = useState([]);
-  const [range, setRange]                   = useState('30d');
+  const [range, setRange]                   = useState('1Y');
   const [loading, setLoading]               = useState(true);
   const [error, setError]                   = useState('');
   const [editOpen, setEditOpen]             = useState(false);
@@ -138,8 +138,8 @@ export default function Item() {
   const chartData = useMemo(() => {
     if (!priceHistory.length) return [];
     const now    = Date.now();
-    const cutoff = range === '30d' ? now - 30 * 86400_000 :
-                   range === '90d' ? now - 90 * 86400_000 : null;
+    const cutoff = range === '1Y' ? now - 365 * 86400_000 :
+                   range === '2Y' ? now - 730 * 86400_000 : null;
     const filtered = cutoff
       ? priceHistory.filter(r => new Date(r.date).getTime() >= cutoff)
       : priceHistory;
@@ -346,7 +346,15 @@ export default function Item() {
                 </div>
               )}
               {item.image_url
-                ? <img src={item.image_url} alt={item.name} className="w-full h-full object-contain p-6" />
+                ? <img
+                    src={item.image_url}
+                    alt={item.name}
+                    className="w-full h-full object-contain p-6"
+                    // Unverified CDN guesses (saved at add-time) can 404 —
+                    // hide the broken image; pricing replaces it with a
+                    // verified URL on the next refresh.
+                    onError={e => { e.currentTarget.style.display = 'none'; }}
+                  />
                 : <ItemIcon type={item.item_type} />
               }
             </div>
@@ -504,7 +512,7 @@ export default function Item() {
               <div className="flex items-center justify-between mb-5">
                 <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Price History</p>
                 <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
-                  {['30d', '90d', 'All'].map(r => (
+                  {['1Y', '2Y', 'All'].map(r => (
                     <button
                       key={r}
                       onClick={() => setRange(r)}

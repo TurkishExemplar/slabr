@@ -428,7 +428,14 @@ export default function Add() {
                         {/* Image thumbnail */}
                         <div className="w-14 h-14 rounded-lg bg-zinc-800 shrink-0 overflow-hidden flex items-center justify-center">
                           {item.image_url ? (
-                            <img src={item.image_url} alt="" className="w-full h-full object-cover" loading="lazy" />
+                            <img
+                              src={item.image_url}
+                              alt=""
+                              className="w-full h-full object-cover"
+                              loading="lazy"
+                              // SCP thumbnails are unverified CDN guesses — hide on 404
+                              onError={e => { e.currentTarget.style.display = 'none'; }}
+                            />
                           ) : (
                             <svg className="w-5 h-5 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
@@ -871,7 +878,12 @@ export default function Add() {
                 {/* Card image preview */}
                 {selectedItem.image_url && (
                   <div className="w-14 h-14 rounded-lg bg-zinc-800 shrink-0 overflow-hidden">
-                    <img src={selectedItem.image_url} alt="" className="w-full h-full object-cover" />
+                    <img
+                      src={selectedItem.image_url}
+                      alt=""
+                      className="w-full h-full object-cover"
+                      onError={e => { e.currentTarget.style.display = 'none'; }}
+                    />
                   </div>
                 )}
                 <div className="flex-1 min-w-0">
