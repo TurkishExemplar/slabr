@@ -125,6 +125,23 @@ CREATE TABLE IF NOT EXISTS app_meta (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Phase 14: PriceCharting sold listings per grade tier (scraped from the
+-- product page's completed-auctions tables; listing_id dedupes re-syncs)
+CREATE TABLE IF NOT EXISTS pc_sales (
+  id SERIAL PRIMARY KEY,
+  catalog_id INT REFERENCES master_catalog(id) ON DELETE CASCADE,
+  listing_id TEXT,
+  grade_label TEXT,
+  sold_date DATE,
+  price NUMERIC(12,2),
+  title TEXT,
+  url TEXT,
+  recorded_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (catalog_id, listing_id)
+);
+CREATE INDEX IF NOT EXISTS pc_sales_catalog_grade_idx
+  ON pc_sales (catalog_id, grade_label, sold_date DESC);
+
 -- Clear bad CDN image_url values so priceSingleItem / refresh-image can re-fetch.
 -- NOTE: data: URIs are intentionally preserved — they are scan photos uploaded
 -- by the user and should remain until eBay's priceSingleItem replaces them with

@@ -36,6 +36,25 @@ const SOURCE_LABEL = {
 
 const EBAY_ATTRIBUTION_STYLE = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
 
+// Multi-grade chart line colors — one per PriceCharting tier; unmapped
+// (user-specific) grades fall back to emerald.
+const GRADE_COLORS = {
+  'Ungraded':  '#71717a',
+  'Grade 7':   '#0ea5e9',
+  'Grade 8':   '#14b8a6',
+  'Grade 9':   '#6366f1',
+  'Grade 9.5': '#8b5cf6',
+  'PSA 10':    '#f59e0b',
+};
+
+// Canonical row order for the grade price table
+function gradeOrderKey(label) {
+  if (label === 'Ungraded') return -1;
+  if (label === 'PSA 10')   return 99;
+  const n = parseFloat(String(label).replace('Grade ', ''));
+  return isNaN(n) ? 50 : n;
+}
+
 function truncateTitle(t, max = 60) {
   if (!t) return '';
   return t.length > max ? t.slice(0, max - 1).trimEnd() + '…' : t;
@@ -76,6 +95,10 @@ export default function Item() {
   const [listings, setListings]               = useState([]);
   const [listingsMeta, setListingsMeta]       = useState(null);
   const [listingsLoading, setListingsLoading] = useState(true);
+
+  // Multi-grade market data: per-tier history series, grade price table,
+  // recent sold listings for this item's grade
+  const [market, setMarket] = useState(null);
 
   // Inline name editing
   const [editingName, setEditingName]               = useState(false);
@@ -135,17 +158,53 @@ export default function Item() {
     // item?.id (not item) — re-running on every item edit would refetch eBay needlessly
   }, [item?.id, id, token]);
 
-  const chartData = useMemo(() => {
-    if (!priceHistory.length) return [];
-    const now    = Date.now();
-    const cutoff = range === '1Y' ? now - 365 * 86400_000 :
-                   range === '2Y' ? now - 730 * 86400_000 : null;
-    const filtered = cutoff
-      ? priceHistory.filter(r => new Date(r.date).getTime() >= cutoff)
-      : priceHistory;
-    // Drop rows where value is null (sold_median and active_low both missing)
-    return filtered.filter(r => r.value != null && parseFloat(r.value) > 0);
-  }, [priceHistory, range]);
+  // Fetch the multi-grade market view (chart series, grade prices, sales)
+  useEffect(() => {
+    if (!item) return;
+    let cancelled = false;
+    fetch(`${API}/api/portfolio/${id}/market`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(data => { if (!cancelled && !data.error) setMarket(data); })
+      .catch(() => { /* chart falls back to the item's own history */ });
+    return () => { cancelled = true; };
+  }, [item?.id, id, token]);
+
+  // Merge the per-grade series into recharts rows ({date, 'Grade 9': v, …}).
+  // Falls back to the item's own price_history as a single series while
+  // market data hasn't loaded (or doesn't exist yet).
+  const { chartRows, chartSeries } = useMemo(() => {
+    const byGrade = market?.history_by_grade && Object.keys(market.history_by_grade).length
+      ? market.history_by_grade
+      : (priceHistory.length
+          ? { 'This item': priceHistory.filter(r => r.value != null && parseFloat(r.value) > 0)
+                                       .map(r => ({ date: r.date, value: parseFloat(r.value) })) }
+          : {});
+
+    const now = Date.now();
+    const cutoff = range === '6M' ? now - 182  * 86400_000 :
+                   range === '1Y' ? now - 365  * 86400_000 :
+                   range === '5Y' ? now - 1825 * 86400_000 : null;
+
+    const rowsByDate = new Map();
+    const series = [];
+    for (const [label, pts] of Object.entries(byGrade)) {
+      let used = 0;
+      for (const p of pts) {
+        const v = parseFloat(p.value);
+        if (!(v > 0)) continue;
+        if (cutoff && new Date(p.date).getTime() < cutoff) continue;
+        if (!rowsByDate.has(p.date)) rowsByDate.set(p.date, { date: p.date });
+        rowsByDate.get(p.date)[label] = v;
+        used++;
+      }
+      if (used) series.push(label);
+    }
+    series.sort((a, b) => gradeOrderKey(a) - gradeOrderKey(b));
+    const rows = [...rowsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+    return { chartRows: rows, chartSeries: series };
+  }, [market, priceHistory, range]);
 
   async function handleSave() {
     setSaving(true);
@@ -512,7 +571,7 @@ export default function Item() {
               <div className="flex items-center justify-between mb-5">
                 <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Price History</p>
                 <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
-                  {['1Y', '2Y', 'All'].map(r => (
+                  {['6M', '1Y', '5Y', 'All'].map(r => (
                     <button
                       key={r}
                       onClick={() => setRange(r)}
@@ -525,46 +584,98 @@ export default function Item() {
                   ))}
                 </div>
               </div>
-              {chartData.length >= 1 ? (
-                <ResponsiveContainer width="100%" height={180}>
-                  <LineChart data={chartData} margin={{ top: 2, right: 4, bottom: 0, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                    <XAxis
-                      dataKey="date"
-                      tick={{ fill: '#71717a', fontSize: 10 }}
-                      tickFormatter={d => { const [, m, day] = d.split('-'); return `${m}/${day}`; }}
-                    />
-                    <YAxis
-                      tick={{ fill: '#71717a', fontSize: 10 }}
-                      width={56}
-                      // Fit the axis to the data range — a $1,400–$1,500 card
-                      // shouldn't be plotted on a $0-based axis as a flat line.
-                      domain={['auto', 'auto']}
-                      // One decimal under $10K so a tight domain doesn't render
-                      // duplicate "$7K $7K $8K" ticks
-                      tickFormatter={v => v >= 10000 ? `$${(v/1000).toFixed(0)}K` : v >= 1000 ? `$${(v/1000).toFixed(1)}K` : `$${v}`}
-                    />
-                    <Tooltip
-                      contentStyle={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 8 }}
-                      labelStyle={{ color: '#a1a1aa', fontSize: 11 }}
-                      formatter={v => [fmt$(parseFloat(v)), 'Value']}
-                    />
-                    {/* A single data point can't draw a line — show a labeled dot instead */}
-                    <Line
-                      type="monotone"
-                      dataKey="value"
-                      stroke={isOneOfOne ? '#f59e0b' : '#6366f1'}
-                      strokeWidth={2}
-                      dot={chartData.length === 1
-                        ? { r: 5, fill: isOneOfOne ? '#f59e0b' : '#6366f1', strokeWidth: 0 }
-                        : false}
-                      label={chartData.length === 1
-                        ? { position: 'top', fill: '#a1a1aa', fontSize: 11, formatter: v => fmt$(parseFloat(v)) }
-                        : undefined}
-                      activeDot={{ r: 4 }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
+              {chartRows.length >= 1 ? (
+                <>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={chartRows} margin={{ top: 2, right: 4, bottom: 0, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                      <XAxis
+                        dataKey="date"
+                        tick={{ fill: '#71717a', fontSize: 10 }}
+                        tickFormatter={d => { const [y, m] = d.split('-'); return `${m}/${y.slice(2)}`; }}
+                      />
+                      <YAxis
+                        tick={{ fill: '#71717a', fontSize: 10 }}
+                        width={56}
+                        domain={['auto', 'auto']}
+                        tickFormatter={v => v >= 10000 ? `$${(v/1000).toFixed(0)}K` : v >= 1000 ? `$${(v/1000).toFixed(1)}K` : `$${v}`}
+                      />
+                      <Tooltip
+                        contentStyle={{ background: '#18181b', border: '1px solid #27272a', borderRadius: 8 }}
+                        labelStyle={{ color: '#a1a1aa', fontSize: 11 }}
+                        formatter={(v, name) => [fmt$(parseFloat(v)), name]}
+                      />
+                      {chartSeries.map(label => {
+                        const isUser = label === 'This item' || market?.user_tier === label;
+                        return (
+                          <Line
+                            key={label}
+                            type="monotone"
+                            dataKey={label}
+                            stroke={GRADE_COLORS[label] ?? '#10b981'}
+                            strokeWidth={isUser ? 2.5 : 1.2}
+                            strokeOpacity={isUser ? 1 : 0.55}
+                            dot={chartRows.length === 1 ? { r: 4, strokeWidth: 0, fill: GRADE_COLORS[label] ?? '#10b981' } : false}
+                            activeDot={{ r: 4 }}
+                            connectNulls
+                          />
+                        );
+                      })}
+                    </LineChart>
+                  </ResponsiveContainer>
+
+                  {/* Legend — the user's grade reads solid, others dimmed */}
+                  {chartSeries.length > 1 && (
+                    <div className="flex flex-wrap gap-1.5 mt-3">
+                      {chartSeries.map(label => (
+                        <span
+                          key={label}
+                          className={`inline-flex items-center text-[10px] px-2 py-0.5 rounded-full border ${
+                            market?.user_tier === label
+                              ? 'border-zinc-500 text-white font-semibold'
+                              : 'border-zinc-800 text-zinc-500'
+                          }`}
+                        >
+                          <span className="w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[label] ?? '#10b981' }} />
+                          {label}{market?.user_tier === label ? ' · yours' : ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Grade price table */}
+                  {market?.grade_prices?.length > 0 && (
+                    <div className="mt-4 border-t border-zinc-800 pt-3">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-zinc-600 text-[10px] uppercase tracking-wider">
+                            <th className="text-left font-medium pb-1.5">Grade</th>
+                            <th className="text-right font-medium pb-1.5">Price</th>
+                            <th className="text-right font-medium pb-1.5">30d Change</th>
+                            <th className="text-right font-medium pb-1.5">Vol 90d</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...market.grade_prices]
+                            .sort((a, b) => gradeOrderKey(a.grade) - gradeOrderKey(b.grade))
+                            .map(g => (
+                              <tr key={g.grade} className={g.is_user_grade ? 'text-white font-semibold' : 'text-zinc-400'}>
+                                <td className="py-1">
+                                  <span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[g.grade] ?? '#10b981' }} />
+                                  {g.grade}{g.is_user_grade ? ' · yours' : ''}
+                                </td>
+                                <td className="text-right py-1">{fmt$(g.current)}</td>
+                                <td className={`text-right py-1 ${g.change > 0 ? 'text-emerald-400' : g.change < 0 ? 'text-red-400' : 'text-zinc-600'}`}>
+                                  {g.change !== 0 ? `${g.change > 0 ? '+' : '−'}${fmt$(Math.abs(g.change))}` : '—'}
+                                </td>
+                                <td className="text-right py-1 text-zinc-500">{g.volume_90d || '—'}</td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="h-[180px] flex flex-col items-center justify-center gap-2">
                   <svg className="w-8 h-8 text-zinc-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -624,6 +735,48 @@ export default function Item() {
                 )}
               </div>
             </div>
+
+            {/* Recent Sales — sold listings for this item's grade */}
+            {market?.sales?.length > 0 && (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Recent Sales</p>
+                  <span className={`text-[10px] border px-2 py-0.5 rounded-full ${SOURCE_STYLE.pricecharting}`}>
+                    Sold listings via PriceCharting
+                  </span>
+                </div>
+                <p className="text-zinc-600 text-xs mb-3">
+                  Last {market.sales.length} sales
+                  {market.user_bucket !== market.user_tier
+                    ? (market.sales_filtered
+                        ? ` · ${market.user_bucket} bucket, filtered to ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
+                        : ` · ${market.user_bucket} bucket (no exact ${[item.grading_company, item.grade].filter(Boolean).join(' ')} listings)`)
+                    : ` · ${market.user_tier}`}
+                </p>
+                <div className="divide-y divide-zinc-800 max-h-80 overflow-y-auto">
+                  {market.sales.map((s, i) => (
+                    <div key={i} className="flex items-center gap-3 py-2">
+                      <span className="text-zinc-600 text-xs w-20 shrink-0">{s.date}</span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 shrink-0">
+                        {s.grade_label}
+                      </span>
+                      <p className="flex-1 text-zinc-500 text-xs truncate">{s.title ?? '—'}</p>
+                      <span className="text-zinc-200 text-sm font-medium shrink-0">{fmt$(s.price)}</span>
+                      {s.url && (
+                        <a
+                          href={s.url.replace(/&amp;/g, '&')}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-indigo-400 hover:text-indigo-300 text-xs transition shrink-0"
+                        >
+                          ↗
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Active eBay Listings */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">

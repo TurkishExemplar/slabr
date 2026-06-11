@@ -598,41 +598,158 @@ function pcProductImage(product) {
   return null;
 }
 
-// Resolve a product's real image by fetching its page: /game/<id> 301s to the
-// canonical slug page, which embeds the storage.googleapis.com image URL.
-// Results (including misses) are cached for the process lifetime — repeat
-// searches and refreshes cost nothing.  Returns null when the card has no
-// photo or PC's bot protection blocks the host (logged, graceful).
-const _pcImageCache = new Map();
+// ── PriceCharting product PAGE data ───────────────────────────────────────────
+//
+// The product page embeds everything the API doesn't expose:
+//   VGPC.chart_data — per-tier monthly price series back to ~2020:
+//     used=Ungraded, cib=Grade 7, new=Grade 8, graded=Grade 9,
+//     boxonly=Grade 9.5, manualonly=PSA 10   ([epoch_ms, cents] pairs)
+//   completed-auctions-* tables — the ~30 most recent sold listings per tier
+//     (<tr id="ebay-LISTINGID"> rows with date / title / price / eBay URL)
+//   the real card image (storage.googleapis.com/images.pricecharting.com/<hash>/)
+//
+// /game/<id> 301s to the canonical page, so the numeric API product id is all
+// that's needed.  PC rate-limits bursts (403) — fetches are cached on success,
+// never cached on failure, and callers degrade gracefully.
+
 const PC_PAGE_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 
-async function fetchPcPageImage(productId) {
+// chart_data key → tier identity.  Tiers below 10 are company-agnostic; the
+// top tier is PC's "PSA 10" column.
+const PC_TIERS = {
+  used:       { condition: 'raw',    grade: null,  label: 'Ungraded'  },
+  cib:        { condition: 'graded', grade: '7',   label: 'Grade 7'   },
+  new:        { condition: 'graded', grade: '8',   label: 'Grade 8'   },
+  graded:     { condition: 'graded', grade: '9',   label: 'Grade 9'   },
+  boxonly:    { condition: 'graded', grade: '9.5', label: 'Grade 9.5' },
+  manualonly: { condition: 'graded', grade: '10',  label: 'PSA 10'    },
+};
+
+// completed-auctions section suffix → tier label (sales tables)
+const PC_SALES_SECTIONS = {
+  'used':        'Ungraded',
+  'cib':         'Grade 7',
+  'new':         'Grade 8',
+  'graded':      'Grade 9',
+  'box-only':    'Grade 9.5',
+  'manual-only': 'PSA 10',
+};
+
+const PC_WORD_NUMBERS = {
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+};
+
+// Resolve a completed-auctions section key to a display label.
+// Returns null for sections we can't truthfully label (game-completeness
+// combos like "loose-and-box", and the numbered 17+ company tiers whose
+// company assignment is unconfirmed) — their rows are skipped.
+function pcSectionLabel(key) {
+  if (PC_SALES_SECTIONS[key]) return PC_SALES_SECTIONS[key];
+  const gm = key?.match(/^grade-([a-z]+)$/);
+  if (gm && PC_WORD_NUMBERS[gm[1]] != null) return `Grade ${PC_WORD_NUMBERS[gm[1]]}`;
+  return null;
+}
+
+// Pure parser — exercised in tests against a saved real page.
+// Returns { image, chart: {tierKey: [{date, cents}]}, sales: [{listingId,
+// gradeLabel, date, price, title, url}] }.
+function parsePcPage(html) {
+  // Image
+  const im = html.match(/https:\/\/storage\.googleapis\.com\/images\.pricecharting\.com\/([a-z0-9]+)\/\d+\.jpg/i);
+  const image = im ? `https://storage.googleapis.com/images.pricecharting.com/${im[1]}/1600.jpg` : null;
+
+  // Chart series
+  const chart = {};
+  const cm = html.match(/VGPC\.chart_data\s*=\s*(\{[\s\S]*?\});/);
+  if (cm) {
+    try {
+      const raw = JSON.parse(cm[1]);
+      for (const [key, series] of Object.entries(raw)) {
+        if (!PC_TIERS[key] || !Array.isArray(series)) continue;
+        chart[key] = series
+          .filter(pt => Array.isArray(pt) && pt[1] > 0)
+          .map(pt => ({ date: new Date(pt[0]).toISOString().slice(0, 10), cents: Math.round(pt[1]) }));
+      }
+    } catch (err) {
+      console.warn(`[pricecharting] chart_data parse failed: ${err.message}`);
+    }
+  }
+
+  // Sold listings — rows live inside per-tier containers like
+  // <div class="completed-auctions-used">.  (The class must START with the
+  // marker — tab-bar buttons carry "tab ... completed-auctions-used" and are
+  // navigation, not containers.)  Rows attribute to the nearest preceding
+  // container marker.
+  const sales = [];
+  const sectionRe = /<div class="completed-auctions-([a-z0-9-]+)"/g;
+  const markers = [];
+  let sm;
+  while ((sm = sectionRe.exec(html)) !== null) {
+    markers.push({ key: sm[1], index: sm.index });
+  }
+  const rowRe = /<tr id="ebay-(\d+)">\s*<td class="date">(\d{4}-\d{2}-\d{2})<\/td>[\s\S]*?(?:href="([^"]*)"[^>]*>\s*([^<]+?)\s*<\/a>\s*\[eBay\][\s\S]*?)?<span class="js-price"\s*>\$([\d,]+(?:\.\d+)?)<\/span>/g;
+  let rm;
+  while ((rm = rowRe.exec(html)) !== null) {
+    // nearest preceding section marker
+    let section = null;
+    for (const mk of markers) {
+      if (mk.index < rm.index) section = mk.key;
+      else break;
+    }
+    const gradeLabel = pcSectionLabel(section);
+    if (!gradeLabel) continue; // ambiguous section — skip rather than mislabel
+
+    sales.push({
+      listingId:  rm[1],
+      gradeLabel,
+      date:       rm[2],
+      url:        rm[3] ?? null,
+      title:      (rm[4] ?? '').trim() || null,
+      price:      parseFloat(rm[5].replace(/,/g, '')),
+    });
+  }
+
+  return { image, chart, sales };
+}
+
+// Cached page fetch+parse.  Successful parses are cached with a 20-hour TTL —
+// long enough that one daily cron pass reuses a single fetch across all of a
+// catalog's combos, short enough that the NEXT day's pass picks up newly
+// published points and sales (the server process lives across cron runs).
+// Bot-protection failures are never cached so later attempts can succeed.
+const _pcPageCache = new Map();
+const PC_PAGE_TTL_MS = 20 * 60 * 60 * 1000;
+
+async function fetchPcPage(productId) {
   const id = String(productId ?? '');
   if (!/^\d+$/.test(id)) return null;
-  if (_pcImageCache.has(id)) return _pcImageCache.get(id);
+  const hit = _pcPageCache.get(id);
+  if (hit && Date.now() - hit.at < PC_PAGE_TTL_MS) return hit.data;
 
   try {
     const resp = await fetch(`https://www.pricecharting.com/game/${id}`, {
       redirect: 'follow',
       headers: { 'User-Agent': PC_PAGE_UA },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(12_000),
     });
     if (resp.ok) {
-      const html = await resp.text();
-      const m = html.match(/https:\/\/storage\.googleapis\.com\/images\.pricecharting\.com\/([a-z0-9]+)\/\d+\.jpg/i);
-      const image = m ? `https://storage.googleapis.com/images.pricecharting.com/${m[1]}/1600.jpg` : null;
-      // Cache definitive answers only — a 200 page either has the photo or
-      // the card genuinely has none.
-      _pcImageCache.set(id, image);
-      return image;
+      const parsed = parsePcPage(await resp.text());
+      console.log(`[pricecharting] page /game/${id}: image=${parsed.image ? 'yes' : 'no'}, chart tiers=${Object.keys(parsed.chart).length}, sales=${parsed.sales.length}`);
+      _pcPageCache.set(id, { data: parsed, at: Date.now() });
+      return parsed;
     }
-    // 403/429 = bot protection or rate limiting — do NOT cache, a later
-    // (gentler) attempt may succeed.
-    console.warn(`[pricecharting] image page /game/${id} → HTTP ${resp.status} (not cached)`);
+    console.warn(`[pricecharting] page /game/${id} → HTTP ${resp.status} (not cached)`);
   } catch (err) {
-    console.warn(`[pricecharting] image page /game/${id} failed: ${err.message} (not cached)`);
+    console.warn(`[pricecharting] page /game/${id} failed: ${err.message} (not cached)`);
   }
   return null;
+}
+
+// Image-only convenience wrapper (used by the pricing and search paths)
+async function fetchPcPageImage(productId) {
+  const page = await fetchPcPage(productId);
+  return page?.image ?? null;
 }
 
 function escapeRegExp(s) {
@@ -1003,6 +1120,7 @@ async function fetchPcPriceHistory(baseUrl, productId, token) {
   const candidates = [
     `${baseUrl}/api/product/history?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/product/prices?t=${tEnc}&id=${idEnc}`,
+    `${baseUrl}/api/product/sales?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/prices?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/sales?t=${tEnc}&id=${idEnc}`,
     `${baseUrl}/api/product?t=${tEnc}&id=${idEnc}&country=US`,
@@ -1070,32 +1188,63 @@ async function backfillPcHistory(catalogId, condition, grade, points, todayPrice
   return inserted;
 }
 
-// History sync — runs on EVERY price refresh.  Idempotent: backfillPcHistory
-// only inserts dates that don't already have a pricecharting row, so repeat
-// runs just pick up whatever new points PC has published since last time.
+// Upsert sold listings scraped from the product page; the (catalog_id,
+// listing_id) unique constraint makes re-syncs no-ops for known sales.
+async function upsertPcSales(catalogId, sales) {
+  let inserted = 0;
+  for (const s of sales) {
+    if (!s.listingId || !s.date || !(s.price > 0)) continue;
+    const { rowCount } = await pool.query(`
+      INSERT INTO pc_sales (catalog_id, listing_id, grade_label, sold_date, price, title, url)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (catalog_id, listing_id) DO NOTHING
+    `, [catalogId, s.listingId, s.gradeLabel, s.date, s.price, s.title, s.url]);
+    inserted += rowCount;
+  }
+  return inserted;
+}
+
+// Market-data sync — runs on EVERY price refresh.  Idempotent throughout:
+// history inserts skip existing dates, sales upserts skip known listings.
+//
+// Primary source is the product PAGE: its embedded chart carries SIX per-tier
+// monthly series back to ~2020 (each stored under that tier's own
+// (condition, grade) combo — this is what drives the multi-grade chart), and
+// its completed-auctions tables carry the recent sold listings per tier.
+// When the page is unreachable (PC bot protection), falls back to probing the
+// undocumented API endpoints for a single banded series, as before.
 async function syncPcHistory(catalogId, condition, grade, pc) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
-  if (!pc?.productId || !pc?.baseUrl || !token) return;
+  if (!pc?.productId || !token) return;
   try {
-    const points = await fetchPcPriceHistory(pc.baseUrl, pc.productId, token);
+    const page = await fetchPcPage(pc.productId);
+    if (page && (Object.keys(page.chart).length || page.sales.length)) {
+      let histInserted = 0;
+      for (const [key, series] of Object.entries(page.chart)) {
+        const tier = PC_TIERS[key];
+        // Tier series ARE their grade's data — no sanity band needed.
+        histInserted += await backfillPcHistory(catalogId, tier.condition, tier.grade, series, null);
+      }
+      const salesInserted = await upsertPcSales(catalogId, page.sales);
+      if (histInserted || salesInserted) {
+        console.log(`[pricecharting] page sync catalog_id=${catalogId}: +${histInserted} history points, +${salesInserted} sales`);
+      }
+      return;
+    }
 
-    // Sanity-band width depends on how much the history can be trusted to be
-    // THIS grade's series:
-    //   grade-specific product → its history IS this grade        (wide)
-    //   raw / ungraded item    → product history tracks raw sales (medium)
-    //   generic graded match   → product-level data may mix grades; a narrow
-    //                            band rejects adjacent-tier contamination
+    // ── Fallback: undocumented API history endpoints (single series) ───────
+    if (!pc.baseUrl) return;
+    const points = await fetchPcPriceHistory(pc.baseUrl, pc.productId, token);
     const gradeSpecific = (pc.field ?? '').includes('grade-specific');
     const [lo, hi] = gradeSpecific            ? [0.25, 4]
                    : condition !== 'graded'   ? [0.5, 2]
                    :                            [0.6, 1.67];
-
     const inserted = await backfillPcHistory(catalogId, condition, grade, points, pc.price, lo, hi);
     if (inserted) {
-      console.log(`[pricecharting] backfilled ${inserted} historic points for catalog_id=${catalogId} (${condition} ${grade ?? ''}, band ${lo}-${hi}x)`);
+      console.log(`[pricecharting] endpoint backfill: ${inserted} points for catalog_id=${catalogId} (${condition} ${grade ?? ''}, band ${lo}-${hi}x)`);
     }
   } catch (err) {
-    console.warn(`[pricecharting] history backfill failed for catalog_id=${catalogId}: ${err.message}`);
+    console.warn(`[pricecharting] market sync failed for catalog_id=${catalogId}: ${err.message}`);
   }
 }
 
@@ -1362,6 +1511,7 @@ async function scpSearch(query, limit = 8) {
 module.exports = {
   runEbayJob, scpSearch, priceSingleItem, fetchActiveListings,
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
-  extractPcHistoryPoints, fetchPcPriceHistory,
-  PC_BASES, PC_JUNK_CONSOLE_RE,
+  extractPcHistoryPoints, fetchPcPriceHistory, parsePcPage, fetchPcPage,
+  backfillPcHistory, upsertPcSales,
+  PC_BASES, PC_JUNK_CONSOLE_RE, PC_TIERS,
 };

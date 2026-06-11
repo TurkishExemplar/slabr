@@ -4,6 +4,20 @@ const { fetchActiveListings, buildQuery } = require('../jobs/ebay');
 
 const router = express.Router();
 
+// Map an item's (condition, grading_company, grade) to its PriceCharting tier
+// label.  Half grades have no tier of their own — they bucket to the floor
+// grade for sold-listing lookups (a BGS 8.5 shops in the Grade 8 bucket,
+// title-filtered to actual 8.5 slabs).
+function pcTierLabelFor(item) {
+  if (item.condition !== 'graded') return { label: 'Ungraded', halfGrade: false };
+  const g = parseFloat(item.grade);
+  if (isNaN(g))  return { label: 'Grade 9', halfGrade: false };
+  if (g >= 10)   return { label: 'PSA 10', halfGrade: false };
+  if (g === 9.5) return { label: 'Grade 9.5', halfGrade: false };
+  if (g % 1 !== 0) return { label: `Grade ${Math.floor(g)}`, halfGrade: true };
+  return { label: `Grade ${g}`, halfGrade: false };
+}
+
 // Shared SELECT fragment for portfolio items
 const ITEM_SELECT = `
   pi.id, pi.catalog_id, pi.condition, pi.grading_company, pi.grade,
@@ -236,6 +250,120 @@ router.get('/:id', async (req, res) => {
     res.json({ ...item, price_history: historyRows, comparable_sales: comparableSales });
   } catch (err) {
     console.error('[portfolio GET /:id]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/portfolio/:id/market
+// Multi-grade market view for the item detail page:
+//   history_by_grade — one series per PriceCharting tier (and the user's own
+//     grade when it differs), from pricecharting price_history rows
+//   grade_prices     — per-tier current price, change vs ~30 days ago, and
+//     90-day sales volume
+//   sales            — recent sold listings for the user's grade bucket
+//     (half grades title-filter the floor bucket, e.g. BGS 8.5 in Grade 8)
+//   user_tier        — which series/bucket is the user's, for highlighting
+router.get('/:id/market', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT pi.catalog_id, pi.condition, pi.grade, pi.grading_company
+      FROM portfolio_items pi
+      WHERE pi.id = $1 AND pi.user_id = $2
+    `, [req.params.id, req.user.userId]);
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+
+    const item = rows[0];
+    const { label: userLabel, halfGrade } = pcTierLabelFor(item);
+
+    // Series labels normalize through parseFloat so free-text grades ('9.0',
+    // '09') merge with the canonical tier series ('9') instead of rendering
+    // as a separate sparse line.
+    const tierLabel = (condition, grade) => {
+      if (condition !== 'graded') return 'Ungraded';
+      const n = parseFloat(grade);
+      if (isNaN(n)) return 'Graded';
+      return n >= 10 ? 'PSA 10' : `Grade ${n}`;
+    };
+    const userSeries = tierLabel(item.condition, item.grade);
+
+    // ── Per-tier history series ───────────────────────────────────────────
+    const { rows: hist } = await pool.query(`
+      SELECT date, value, condition, grade FROM (
+        SELECT DISTINCT ON (condition, grade, date_trunc('day', recorded_at))
+          date_trunc('day', recorded_at)::date::text AS date,
+          ROUND(sold_median::numeric, 2) AS value,
+          condition, grade
+        FROM price_history
+        WHERE catalog_id = $1
+          AND source = 'pricecharting'
+          AND sold_median IS NOT NULL
+        ORDER BY condition, grade, date_trunc('day', recorded_at), recorded_at DESC
+      ) t
+      ORDER BY date ASC
+    `, [item.catalog_id]);
+
+    const historyByGrade = {};
+    for (const r of hist) {
+      const label = tierLabel(r.condition, r.grade);
+      (historyByGrade[label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
+    }
+
+    // ── Grade price table: current, ~30d change, 90d volume ──────────────
+    const { rows: vol } = await pool.query(`
+      SELECT grade_label, COUNT(*)::int AS n
+      FROM pc_sales
+      WHERE catalog_id = $1 AND sold_date > NOW() - INTERVAL '90 days'
+      GROUP BY grade_label
+    `, [item.catalog_id]);
+    const volumeByLabel = Object.fromEntries(vol.map(v => [v.grade_label, v.n]));
+
+    const gradePrices = Object.entries(historyByGrade).map(([label, series]) => {
+      const current = series[series.length - 1];
+      const cutoff  = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
+      const past    = [...series].reverse().find(p => p.date <= cutoff) ?? series[0];
+      return {
+        grade:    label,
+        current:  current.value,
+        change:   past && past !== current ? parseFloat((current.value - past.value).toFixed(2)) : 0,
+        volume_90d: volumeByLabel[label] ?? 0,
+        is_user_grade: label === userSeries,
+      };
+    });
+
+    // ── Sold listings for the user's bucket ──────────────────────────────
+    const { rows: bucketSales } = await pool.query(`
+      SELECT sold_date::text AS date, grade_label, price, title, url
+      FROM pc_sales
+      WHERE catalog_id = $1 AND grade_label = $2
+      ORDER BY sold_date DESC
+      LIMIT 60
+    `, [item.catalog_id, userLabel]);
+
+    let sales = bucketSales;
+    let salesFiltered = false;
+    if (halfGrade && item.grading_company) {
+      // e.g. BGS 8.5: only actual 8.5 slabs from the Grade 8 bucket.
+      // When no listing title carries the exact half grade, fall back to the
+      // whole bucket — sales_filtered tells the UI which one it got.
+      const esc = String(item.grade).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re  = new RegExp(`${item.grading_company}\\s*-?\\s*${esc}(?![0-9])`, 'i');
+      const filtered = bucketSales.filter(s => re.test(s.title ?? ''));
+      if (filtered.length) {
+        sales = filtered;
+        salesFiltered = true;
+      }
+    }
+
+    res.json({
+      user_tier:        userSeries,
+      user_bucket:      userLabel,
+      history_by_grade: historyByGrade,
+      grade_prices:     gradePrices,
+      sales:            sales.slice(0, 30).map(s => ({ ...s, price: parseFloat(s.price) })),
+      sales_filtered:   salesFiltered,
+    });
+  } catch (err) {
+    console.error('[portfolio GET /:id/market]', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });
