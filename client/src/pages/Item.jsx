@@ -37,9 +37,16 @@ const SOURCE_LABEL = {
 const EBAY_ATTRIBUTION_STYLE = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
 
 // Multi-grade chart line colors — one per PriceCharting tier; unmapped
-// (user-specific) grades fall back to emerald.
+// (user-specific) grades fall back to emerald.  Grades 1–6 are derived from
+// sold-listing medians (no native PC chart series).
 const GRADE_COLORS = {
   'Ungraded':  '#71717a',
+  'Grade 1':   '#fca5a5',
+  'Grade 2':   '#f87171',
+  'Grade 3':   '#fb923c',
+  'Grade 4':   '#fbbf24',
+  'Grade 5':   '#a3e635',
+  'Grade 6':   '#4ade80',
   'Grade 7':   '#0ea5e9',
   'Grade 8':   '#14b8a6',
   'Grade 9':   '#6366f1',
@@ -99,6 +106,10 @@ export default function Item() {
   // Multi-grade market data: per-tier history series, grade price table,
   // recent sold listings for this item's grade
   const [market, setMarket] = useState(null);
+
+  // Which grade line(s) the chart shows — null resolves to the user's grade
+  // bucket once market data loads ('All' shows every line)
+  const [gradeView, setGradeView] = useState(null);
 
   // Inline name editing
   const [editingName, setEditingName]               = useState(false);
@@ -205,6 +216,14 @@ export default function Item() {
     const rows = [...rowsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     return { chartRows: rows, chartSeries: series };
   }, [market, priceHistory, range]);
+
+  // Default the dropdown to the user's grade bucket (the most relevant
+  // well-populated line); 'All' overlays every grade.
+  const resolvedGradeView =
+    gradeView ?? (market?.user_bucket && chartSeries.includes(market.user_bucket) ? market.user_bucket : 'All');
+  const visibleSeries = resolvedGradeView === 'All'
+    ? chartSeries
+    : chartSeries.filter(l => l === resolvedGradeView);
 
   async function handleSave() {
     setSaving(true);
@@ -568,20 +587,36 @@ export default function Item() {
 
             {/* Price history chart */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
-              <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center justify-between gap-2 mb-5 flex-wrap">
                 <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Price History</p>
-                <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
-                  {['6M', '1Y', '5Y', 'All'].map(r => (
-                    <button
-                      key={r}
-                      onClick={() => setRange(r)}
-                      className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
-                        range === r ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
-                      }`}
+                <div className="flex items-center gap-2">
+                  {chartSeries.length > 1 && (
+                    <select
+                      value={resolvedGradeView}
+                      onChange={e => setGradeView(e.target.value)}
+                      className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-indigo-500"
                     >
-                      {r}
-                    </button>
-                  ))}
+                      <option value="All">All grades</option>
+                      {chartSeries.map(l => (
+                        <option key={l} value={l}>
+                          {l}{market?.user_tier === l ? ' (yours)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
+                    {['6M', '1Y', '5Y', 'All'].map(r => (
+                      <button
+                        key={r}
+                        onClick={() => setRange(r)}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                          range === r ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
+                        }`}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
               {chartRows.length >= 1 ? (
@@ -605,16 +640,17 @@ export default function Item() {
                         labelStyle={{ color: '#a1a1aa', fontSize: 11 }}
                         formatter={(v, name) => [fmt$(parseFloat(v)), name]}
                       />
-                      {chartSeries.map(label => {
-                        const isUser = label === 'This item' || market?.user_tier === label;
+                      {visibleSeries.map(label => {
+                        const isUser  = label === 'This item' || market?.user_tier === label;
+                        const isSolo  = visibleSeries.length === 1;
                         return (
                           <Line
                             key={label}
                             type="monotone"
                             dataKey={label}
                             stroke={GRADE_COLORS[label] ?? '#10b981'}
-                            strokeWidth={isUser ? 2.5 : 1.2}
-                            strokeOpacity={isUser ? 1 : 0.55}
+                            strokeWidth={isUser || isSolo ? 2.5 : 1.2}
+                            strokeOpacity={isUser || isSolo ? 1 : 0.55}
                             dot={chartRows.length === 1 ? { r: 4, strokeWidth: 0, fill: GRADE_COLORS[label] ?? '#10b981' } : false}
                             activeDot={{ r: 4 }}
                             connectNulls
@@ -624,8 +660,8 @@ export default function Item() {
                     </LineChart>
                   </ResponsiveContainer>
 
-                  {/* Legend — the user's grade reads solid, others dimmed */}
-                  {chartSeries.length > 1 && (
+                  {/* Legend — only in the all-grades overlay view */}
+                  {resolvedGradeView === 'All' && chartSeries.length > 1 && (
                     <div className="flex flex-wrap gap-1.5 mt-3">
                       {chartSeries.map(label => (
                         <span

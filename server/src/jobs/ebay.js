@@ -1041,6 +1041,45 @@ async function pcLookupOnBase(baseUrl, item, token) {
   return null;
 }
 
+// Half grades interpolate between tiers, but real comps beat any midpoint:
+// when the product page's sold listings contain enough recent title-matched
+// sales of THIS exact half grade (e.g. "BGS 8.5"), the price becomes their
+// median.  A BGS 8.5 whose comps all sit at Grade-8 money must not be valued
+// halfway to Grade 9.
+async function refineHalfGradeFromSales(result, item) {
+  const g = parseFloat(item.grade);
+  if (!result?.productId) return result;
+  if (item.condition !== 'graded' || isNaN(g) || g % 1 === 0 || !item.grading_company) return result;
+  if (!String(result.field ?? '').includes('avg(')) return result; // exact tiers stay
+
+  try {
+    const page = await fetchPcPage(result.productId);
+    if (!page?.sales?.length) return result;
+
+    const bucket = `Grade ${Math.floor(g)}`;
+    const re     = new RegExp(`${item.grading_company}\\s*-?\\s*${escapeRegExp(String(item.grade))}(?![0-9])`, 'i');
+    const cutoff = new Date(Date.now() - 180 * 86400_000).toISOString().slice(0, 10);
+
+    const comps = page.sales
+      .filter(s => s.gradeLabel === bucket && s.date >= cutoff && s.price > 0 && re.test(s.title ?? ''))
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, 10);
+    if (comps.length < 3) return result; // too thin — keep the interpolation
+
+    const sorted = comps.map(s => s.price).sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    console.log(`[pricecharting] half-grade comps: median of ${comps.length} recent ${item.grading_company} ${item.grade} sales = $${median} (interpolation said $${result.price})`);
+    return {
+      ...result,
+      price: parseFloat(median.toFixed(2)),
+      field: `median of ${comps.length} recent ${item.grading_company} ${item.grade} sales`,
+    };
+  } catch (err) {
+    console.warn(`[pricecharting] half-grade comp refinement failed: ${err.message}`);
+    return result;
+  }
+}
+
 async function fetchPriceCharting(item) {
   const token = (process.env.PRICE_CHARTING_TOKEN ?? '').trim();
   if (!token) return null;
@@ -1048,7 +1087,7 @@ async function fetchPriceCharting(item) {
   // sportscardspro.com first; pricecharting.com only when it yields nothing.
   for (const baseUrl of PC_BASES) {
     const result = await pcLookupOnBase(baseUrl, item, token);
-    if (result != null) return result;
+    if (result != null) return refineHalfGradeFromSales(result, item);
   }
 
   console.log('[pricecharting] all domains and query variations exhausted — no usable price');

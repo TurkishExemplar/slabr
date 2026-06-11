@@ -308,6 +308,24 @@ router.get('/:id/market', async (req, res) => {
       (historyByGrade[label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
     }
 
+    // Lower grades (1–6) have no chart series on PriceCharting, but their
+    // sold listings exist — derive monthly sale-medians so they chart too.
+    // Only fills labels that don't already have a real tier series.
+    const tierSeriesLabels = new Set(Object.keys(historyByGrade));
+    const { rows: derived } = await pool.query(`
+      SELECT grade_label,
+             date_trunc('month', sold_date)::date::text AS date,
+             (percentile_cont(0.5) WITHIN GROUP (ORDER BY price))::numeric(12,2) AS value
+      FROM pc_sales
+      WHERE catalog_id = $1 AND grade_label IS NOT NULL
+      GROUP BY grade_label, date_trunc('month', sold_date)
+      ORDER BY grade_label, date_trunc('month', sold_date)
+    `, [item.catalog_id]);
+    for (const r of derived) {
+      if (tierSeriesLabels.has(r.grade_label)) continue;
+      (historyByGrade[r.grade_label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
+    }
+
     // ── Grade price table: current, ~30d change, 90d volume ──────────────
     const { rows: vol } = await pool.query(`
       SELECT grade_label, COUNT(*)::int AS n
