@@ -341,12 +341,11 @@ async function _runEbayJobInner(hasEbay) {
           soldMedian = pc.price;
           console.log(`[ebay-job] ${combo.name} | PriceCharting market value: $${soldMedian} (${pc.field})`);
 
-          // Card image from the PriceCharting product — never overwrite a
-          // user-uploaded photo (data: URI).
+          // Catalog image always comes from PriceCharting — per-user photos
+          // live on portfolio_items.custom_image, never here.
           if (pc.image) {
             await pool.query(
-              `UPDATE master_catalog SET image_url = $1
-               WHERE id = $2 AND (image_url IS NULL OR image_url NOT LIKE 'data:%')`,
+              `UPDATE master_catalog SET image_url = $1 WHERE id = $2`,
               [pc.image, combo.catalog_id]
             );
           }
@@ -1041,6 +1040,29 @@ async function pcLookupOnBase(baseUrl, item, token) {
   return null;
 }
 
+// ── Strict grading-company title matching ─────────────────────────────────────
+// A PSA card's comps must be PSA listings only — a BGS 9.5 in the title means
+// it's not a comp for a PSA 9.5.  BGS and Beckett are the same company.
+// company=null means RAW: no grading company may appear at all.
+const PC_COMPANY_RES = {
+  PSA:     /\bPSA\b/i,
+  BGS:     /\b(BGS|BECKETT)\b/i,
+  SGC:     /\bSGC\b/i,
+  CGC:     /\bCGC\b/i,
+};
+
+function titleMatchesCompany(title, company) {
+  const t = title ?? '';
+  const co = company ? (company.toUpperCase() === 'BECKETT' ? 'BGS' : company.toUpperCase()) : null;
+
+  if (!co || !PC_COMPANY_RES[co]) {
+    // Raw (or unknown company): reject titles naming any grading company
+    return !Object.values(PC_COMPANY_RES).some(re => re.test(t));
+  }
+  if (!PC_COMPANY_RES[co].test(t)) return false;
+  return !Object.entries(PC_COMPANY_RES).some(([k, re]) => k !== co && re.test(t));
+}
+
 // Half grades interpolate between tiers, but real comps beat any midpoint:
 // when the product page's sold listings contain enough recent title-matched
 // sales of THIS exact half grade (e.g. "BGS 8.5"), the price becomes their
@@ -1061,7 +1083,9 @@ async function refineHalfGradeFromSales(result, item) {
     const cutoff = new Date(Date.now() - 180 * 86400_000).toISOString().slice(0, 10);
 
     const comps = page.sales
-      .filter(s => s.gradeLabel === bucket && s.date >= cutoff && s.price > 0 && re.test(s.title ?? ''))
+      .filter(s => s.gradeLabel === bucket && s.date >= cutoff && s.price > 0
+        && re.test(s.title ?? '')
+        && titleMatchesCompany(s.title, item.grading_company))
       .sort((a, b) => b.date.localeCompare(a.date))
       .slice(0, 10);
     if (comps.length < 3) return result; // too thin — keep the interpolation
@@ -1343,15 +1367,14 @@ async function priceSingleItem(catalogId, condition, grade) {
       soldMedian = pc.price;
       console.log(`[pricing] PriceCharting market value: $${soldMedian} (${pc.field})`);
 
-      // Card image comes from the PriceCharting product.  Never overwrite a
-      // user-uploaded photo (data: URI from a scan or manual upload).
+      // Catalog image always comes from PriceCharting — per-user photos live
+      // on portfolio_items.custom_image, never here.
       if (pc.image) {
         await pool.query(
-          `UPDATE master_catalog SET image_url = $1
-           WHERE id = $2 AND (image_url IS NULL OR image_url NOT LIKE 'data:%')`,
+          `UPDATE master_catalog SET image_url = $1 WHERE id = $2`,
           [pc.image, catalogId]
         );
-        console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}`);
+        console.log(`[pricing] catalog image set from PriceCharting for catalog_id=${catalogId}: ${pc.image}`);
       }
 
       // Sync PC's price history so the chart shows everything PC exposes —
@@ -1551,6 +1574,6 @@ module.exports = {
   runEbayJob, scpSearch, priceSingleItem, fetchActiveListings,
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
   extractPcHistoryPoints, fetchPcPriceHistory, parsePcPage, fetchPcPage,
-  backfillPcHistory, upsertPcSales,
+  backfillPcHistory, upsertPcSales, titleMatchesCompany,
   PC_BASES, PC_JUNK_CONSOLE_RE, PC_TIERS,
 };

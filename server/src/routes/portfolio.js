@@ -1,6 +1,6 @@
 const express = require('express');
 const pool = require('../db');
-const { fetchActiveListings, buildQuery } = require('../jobs/ebay');
+const { fetchActiveListings, buildQuery, titleMatchesCompany } = require('../jobs/ebay');
 
 const router = express.Router();
 
@@ -25,8 +25,11 @@ const ITEM_SELECT = `
   pi.current_value, pi.active_low, pi.forecast_30d,
   pi.scan_identified, pi.scan_source, pi.added_at,
   pi.is_one_of_one, pi.manual_value, pi.manual_value_set_at,
+  pi.serial_number, pi.custom_value,
   mc.item_type, mc.name, mc.year, mc.brand_publisher, mc.set_name,
-  mc.card_number, mc.variation, mc.sport_game, mc.rarity, mc.image_url,
+  mc.card_number, mc.variation, mc.sport_game, mc.rarity,
+  COALESCE(pi.custom_image, mc.image_url) AS image_url,
+  (pi.custom_image IS NOT NULL)           AS has_custom_image,
   ph.sold_median  AS ph_value,
   ph.source       AS price_source,
   ph.recorded_at  AS price_updated_at
@@ -101,6 +104,11 @@ router.get('/history', async (req, res) => {
           AND (ph.source = 'mock'
                OR (ph.condition IS NOT DISTINCT FROM pi.condition
                    AND ph.grade IS NOT DISTINCT FROM pi.grade))
+          -- Portfolio value only counts each item from when the user owned
+          -- it: purchase_date when entered, otherwise the add date.  Earlier
+          -- market history (the multi-grade backfill reaches 2020) must not
+          -- inflate the chart for periods before ownership.
+          AND ph.recorded_at >= COALESCE(pi.purchase_date::timestamptz, pi.added_at)
         ORDER BY
           pi.id,
           date_trunc('day', ph.recorded_at),
@@ -123,7 +131,7 @@ router.post('/', async (req, res) => {
     catalog_id, condition, grading_company, grade, cert_number,
     quantity, purchase_price, purchase_date,
     scan_identified, scan_source, scan_value, forecast_30d,
-    is_one_of_one, manual_value,
+    is_one_of_one, manual_value, serial_number,
   } = req.body ?? {};
 
   if (!catalog_id) {
@@ -155,8 +163,8 @@ router.post('/', async (req, res) => {
         (user_id, catalog_id, condition, grading_company, grade, cert_number,
          quantity, purchase_price, purchase_date, current_value, forecast_30d,
          scan_identified, scan_source, is_one_of_one, manual_value,
-         manual_value_set_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         manual_value_set_at, serial_number)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       RETURNING *
     `, [
       req.user.userId, catalog_id,
@@ -170,6 +178,7 @@ router.post('/', async (req, res) => {
       is_one_of_one === true,
       manual_value ?? null,
       manual_value != null ? new Date() : null,
+      serial_number?.trim() || null,
     ]);
 
     res.status(201).json(rows[0]);
@@ -361,6 +370,14 @@ router.get('/:id/market', async (req, res) => {
     `, [item.catalog_id]);
     const salesByGrade = {};
     for (const s of allSales) {
+      // Strict company filtering: a graded user sees only their company's
+      // listings in every grade bucket; the Ungraded bucket never shows
+      // slabs regardless of who's looking.
+      if (s.grade_label === 'Ungraded') {
+        if (!titleMatchesCompany(s.title, null)) continue;
+      } else if (item.condition === 'graded' && item.grading_company) {
+        if (!titleMatchesCompany(s.title, item.grading_company)) continue;
+      }
       (salesByGrade[s.grade_label] ??= []).push({ ...s, price: parseFloat(s.price) });
     }
 
@@ -373,15 +390,24 @@ router.get('/:id/market', async (req, res) => {
       LIMIT 60
     `, [item.catalog_id, userLabel]);
 
+    // Strict company filter first: PSA cards only comp against PSA listings,
+    // raw cards exclude every graded listing.  (Graded items with no known
+    // company can't be filtered and keep the whole bucket.)
     let sales = bucketSales;
+    if (item.condition !== 'graded') {
+      sales = bucketSales.filter(s => titleMatchesCompany(s.title, null));
+    } else if (item.grading_company) {
+      sales = bucketSales.filter(s => titleMatchesCompany(s.title, item.grading_company));
+    }
+
     let salesFiltered = false;
     if (halfGrade && item.grading_company) {
       // e.g. BGS 8.5: only actual 8.5 slabs from the Grade 8 bucket.
       // When no listing title carries the exact half grade, fall back to the
-      // whole bucket — sales_filtered tells the UI which one it got.
+      // company-filtered bucket — sales_filtered tells the UI which it got.
       const esc = String(item.grade).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const re  = new RegExp(`${item.grading_company}\\s*-?\\s*${esc}(?![0-9])`, 'i');
-      const filtered = bucketSales.filter(s => re.test(s.title ?? ''));
+      const filtered = sales.filter(s => re.test(s.title ?? ''));
       if (filtered.length) {
         sales = filtered;
         salesFiltered = true;
@@ -443,7 +469,7 @@ router.put('/:id', async (req, res) => {
   const {
     condition, grading_company, grade, cert_number,
     quantity, purchase_price, purchase_date, current_value,
-    manual_value,
+    manual_value, serial_number,
   } = req.body ?? {};
 
   try {
@@ -460,7 +486,8 @@ router.put('/:id', async (req, res) => {
         manual_value         = CASE WHEN $9::numeric IS NOT NULL
                                  THEN $9::numeric ELSE manual_value END,
         manual_value_set_at  = CASE WHEN $9::numeric IS NOT NULL
-                                 THEN NOW() ELSE manual_value_set_at END
+                                 THEN NOW() ELSE manual_value_set_at END,
+        serial_number        = COALESCE($12, serial_number)
       WHERE id = $10 AND user_id = $11
       RETURNING *
     `, [
@@ -468,6 +495,7 @@ router.put('/:id', async (req, res) => {
       quantity, purchase_price, purchase_date, current_value,
       manual_value ?? null,
       req.params.id, req.user.userId,
+      serial_number ?? null,
     ]);
 
     if (!rows.length) return res.status(404).json({ error: 'Item not found' });
@@ -501,18 +529,12 @@ function detectImageType(base64) {
   } catch { return null; }
 }
 
-// POST /api/portfolio/:id/image — replace the catalog image with a user upload
+// POST /api/portfolio/:id/image — set a per-user custom image for this item.
+// Saved on portfolio_items.custom_image, NEVER on master_catalog: only this
+// user's view changes; everyone else keeps the PriceCharting image.
 router.post('/:id/image', async (req, res) => {
   const { image_base64 } = req.body ?? {};
   if (!image_base64) return res.status(400).json({ error: 'image_base64 is required' });
-
-  // Verify ownership and retrieve catalog_id
-  const ownerRes = await pool.query(
-    'SELECT catalog_id FROM portfolio_items WHERE id = $1 AND user_id = $2',
-    [req.params.id, req.user.userId]
-  );
-  if (!ownerRes.rows.length) return res.status(404).json({ error: 'Item not found' });
-  const { catalog_id } = ownerRes.rows[0];
 
   const base64 = image_base64.replace(/^data:[^;]+;base64,/, '');
 
@@ -532,14 +554,106 @@ router.post('/:id/image', async (req, res) => {
   }
 
   try {
-    await pool.query(
-      'UPDATE master_catalog SET image_url = $1 WHERE id = $2',
-      [image_base64, catalog_id]
+    const { rows } = await pool.query(
+      `UPDATE portfolio_items SET custom_image = $1
+       WHERE id = $2 AND user_id = $3
+       RETURNING id`,
+      [image_base64, req.params.id, req.user.userId]
     );
-    res.json({ ok: true, image_url: image_base64 });
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ok: true, image_url: image_base64, has_custom_image: true });
   } catch (err) {
     console.error('[portfolio image upload]', err.message);
     res.status(500).json({ error: 'Image update failed — please try again' });
+  }
+});
+
+// DELETE /api/portfolio/:id/image — remove the custom image, reverting to the
+// catalog (PriceCharting) image.  Returns the image the item falls back to.
+router.delete('/:id/image', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      UPDATE portfolio_items pi SET custom_image = NULL
+      FROM master_catalog mc
+      WHERE pi.id = $1 AND pi.user_id = $2 AND mc.id = pi.catalog_id
+      RETURNING mc.image_url
+    `, [req.params.id, req.user.userId]);
+    if (!rows.length) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ok: true, image_url: rows[0].image_url, has_custom_image: false });
+  } catch (err) {
+    console.error('[portfolio image remove]', err.message);
+    res.status(500).json({ error: 'Image update failed — please try again' });
+  }
+});
+
+// POST /api/portfolio/:id/custom-value — per-item valuation override.
+// body: { mode: 'recent_sale' } → most recent company-matched sale for the
+//                                 item's grade bucket from pc_sales
+//       { mode: 'manual', value: 1234.56 } → user-entered value
+//       { mode: 'clear' } → revert to market valuation
+router.post('/:id/custom-value', async (req, res) => {
+  const { mode, value } = req.body ?? {};
+  if (!['recent_sale', 'manual', 'clear'].includes(mode)) {
+    return res.status(400).json({ error: "mode must be 'recent_sale', 'manual', or 'clear'" });
+  }
+
+  try {
+    const { rows: items } = await pool.query(
+      `SELECT pi.id, pi.catalog_id, pi.condition, pi.grade, pi.grading_company
+       FROM portfolio_items pi WHERE pi.id = $1 AND pi.user_id = $2`,
+      [req.params.id, req.user.userId]
+    );
+    if (!items.length) return res.status(404).json({ error: 'Item not found' });
+    const item = items[0];
+
+    let newValue = null;
+    let saleInfo = null;
+
+    if (mode === 'manual') {
+      const v = parseFloat(value);
+      if (isNaN(v) || v <= 0 || v > 99_999_999) {
+        return res.status(400).json({ error: 'value must be a positive number' });
+      }
+      newValue = v;
+    } else if (mode === 'recent_sale') {
+      const { label } = pcTierLabelFor(item);
+      const { rows: sales } = await pool.query(`
+        SELECT sold_date::text AS date, price, title
+        FROM pc_sales
+        WHERE catalog_id = $1 AND grade_label = $2
+        ORDER BY sold_date DESC
+        LIMIT 60
+      `, [item.catalog_id, label]);
+
+      // Strict company match (and exact half grade when applicable)
+      const g = parseFloat(item.grade);
+      const halfGrade = item.condition === 'graded' && !isNaN(g) && g % 1 !== 0;
+      let candidates = sales.filter(s =>
+        titleMatchesCompany(s.title, item.condition === 'graded' ? item.grading_company : null));
+      if (halfGrade && item.grading_company) {
+        const esc = String(item.grade).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re  = new RegExp(`${item.grading_company}\\s*-?\\s*${esc}(?![0-9])`, 'i');
+        const exact = candidates.filter(s => re.test(s.title ?? ''));
+        if (exact.length) candidates = exact;
+      }
+
+      if (!candidates.length) {
+        return res.status(404).json({ error: 'No recorded sales match this grade and grading company' });
+      }
+      newValue = parseFloat(candidates[0].price);
+      saleInfo = { date: candidates[0].date, title: candidates[0].title };
+    }
+    // mode === 'clear' → newValue stays null
+
+    await pool.query(
+      'UPDATE portfolio_items SET custom_value = $1 WHERE id = $2 AND user_id = $3',
+      [newValue, req.params.id, req.user.userId]
+    );
+
+    res.json({ ok: true, custom_value: newValue, sale: saleInfo });
+  } catch (err) {
+    console.error('[portfolio custom-value]', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 

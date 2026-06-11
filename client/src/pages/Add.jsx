@@ -18,6 +18,17 @@ const CATEGORY_LABELS = {
 
 const GRADING_COMPANIES = ['PSA', 'BGS', 'CGC', 'SGC', 'CSG', 'HGA'];
 
+// Grade ladders per company — BGS/CGC use half grades, PSA/SGC mostly whole.
+// Companies without a specific ladder get the generic half-step scale.
+const GENERIC_GRADES = ['1', '1.5', '2', '2.5', '3', '3.5', '4', '4.5', '5', '5.5', '6', '6.5', '7', '7.5', '8', '8.5', '9', '9.5', '10'];
+const GRADE_OPTIONS = {
+  PSA: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+  BGS: [...GENERIC_GRADES, '10 Black Label'],
+  SGC: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '9.5', '10'],
+  CGC: ['0.5', ...GENERIC_GRADES],
+};
+const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
+
 const INPUT =
   'w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3.5 py-2.5 text-white text-sm ' +
   'placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition';
@@ -27,6 +38,7 @@ const DEFAULT_FORM = {
   grading_company: '',
   grade: '',
   cert_number: '',
+  serial_number: '',
   quantity: 1,
   purchase_price: '',
   purchase_date: '',
@@ -130,6 +142,7 @@ export default function Add() {
           grading_company: data.grading_company  ?? '',
           grade:           data.grade            ?? '',
           cert_number:     data.cert_number      ?? '',
+          serial_number:   '',
           quantity: 1, purchase_price: '', purchase_date: '',
           is_one_of_one: detectOneOfOne(data.name, data.card_number, data.set_name),
           manual_value: '',
@@ -167,6 +180,7 @@ export default function Add() {
         quantity:        parseInt(scanForm.quantity) || 1,
         purchase_price:  scanForm.purchase_price !== '' ? parseFloat(scanForm.purchase_price) : null,
         purchase_date:   scanForm.purchase_date  || null,
+        serial_number:   scanForm.serial_number?.trim() || null,
         scan_identified: true, scan_source: 'claude',
         scan_value:      scanResult.current_value,
         forecast_30d:    scanResult.forecast_30d,
@@ -317,6 +331,7 @@ export default function Add() {
         quantity:        parseInt(form.quantity) || 1,
         purchase_price:  form.purchase_price !== '' ? parseFloat(form.purchase_price) : null,
         purchase_date:   form.purchase_date  || null,
+        serial_number:   form.serial_number?.trim() || null,
         is_one_of_one:   form.is_one_of_one === true,
         manual_value:    form.is_one_of_one && form.manual_value !== ''
                            ? parseFloat(form.manual_value) : null,
@@ -772,16 +787,23 @@ export default function Add() {
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                       <div>
                         <label className="block text-zinc-500 text-xs mb-1.5">Grading Company *</label>
-                        <select value={scanForm.grading_company} onChange={setScanField('grading_company')}
-                          className={INPUT + ' appearance-none'}>
+                        <select
+                          value={scanForm.grading_company}
+                          // Changing company resets the grade — ladders differ
+                          onChange={e => setScanForm(f => ({ ...f, grading_company: e.target.value, grade: '' }))}
+                          className={INPUT + ' appearance-none'}
+                        >
                           <option value="">Select…</option>
                           {GRADING_COMPANIES.map(g => <option key={g} value={g}>{g}</option>)}
                         </select>
                       </div>
                       <div>
                         <label className="block text-zinc-500 text-xs mb-1.5">Grade *</label>
-                        <input type="text" value={scanForm.grade} onChange={setScanField('grade')}
-                          placeholder="e.g. 10" className={INPUT} />
+                        <select value={scanForm.grade} onChange={setScanField('grade')}
+                          className={INPUT + ' appearance-none'}>
+                          <option value="">Select grade…</option>
+                          {gradesFor(scanForm.grading_company).map(g => <option key={g} value={g}>{g}</option>)}
+                        </select>
                       </div>
                       <div>
                         <label className="block text-zinc-500 text-xs mb-1.5">Cert Number</label>
@@ -790,6 +812,12 @@ export default function Add() {
                       </div>
                     </div>
                   )}
+
+                  <div>
+                    <label className="block text-zinc-500 text-xs mb-1.5">Card # / Print Run</label>
+                    <input type="text" value={scanForm.serial_number ?? ''} onChange={setScanField('serial_number')}
+                      placeholder="e.g. 23/99, 1/1 (optional)" className={INPUT} />
+                  </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div>
@@ -942,8 +970,12 @@ export default function Add() {
                     <label className="block text-zinc-400 text-xs font-medium mb-1.5 uppercase tracking-wider">
                       Grading Company <span className="text-red-400">*</span>
                     </label>
-                    <select value={form.grading_company} onChange={setField('grading_company')}
-                      className={INPUT + ' appearance-none'}>
+                    <select
+                      value={form.grading_company}
+                      // Changing company resets the grade — ladders differ
+                      onChange={e => setForm(f => ({ ...f, grading_company: e.target.value, grade: '' }))}
+                      className={INPUT + ' appearance-none'}
+                    >
                       <option value="">Select company…</option>
                       {GRADING_COMPANIES.map(g => <option key={g} value={g}>{g}</option>)}
                     </select>
@@ -952,8 +984,10 @@ export default function Add() {
                     <label className="block text-zinc-400 text-xs font-medium mb-1.5 uppercase tracking-wider">
                       Grade <span className="text-red-400">*</span>
                     </label>
-                    <input type="text" value={form.grade} onChange={setField('grade')}
-                      placeholder="e.g. 10, 9.5, 8" className={INPUT} />
+                    <select value={form.grade} onChange={setField('grade')} className={INPUT + ' appearance-none'}>
+                      <option value="">Select grade…</option>
+                      {gradesFor(form.grading_company).map(g => <option key={g} value={g}>{g}</option>)}
+                    </select>
                   </div>
                   <div>
                     <label className="block text-zinc-400 text-xs font-medium mb-1.5 uppercase tracking-wider">Cert Number</label>
@@ -962,6 +996,12 @@ export default function Add() {
                   </div>
                 </>
               )}
+
+              <div>
+                <label className="block text-zinc-400 text-xs font-medium mb-1.5 uppercase tracking-wider">Card # / Print Run</label>
+                <input type="text" value={form.serial_number} onChange={setField('serial_number')}
+                  placeholder="e.g. 23/99, 1/1, 15/25 (optional)" className={INPUT} />
+              </div>
 
               <div>
                 <label className="block text-zinc-400 text-xs font-medium mb-1.5 uppercase tracking-wider">Quantity</label>

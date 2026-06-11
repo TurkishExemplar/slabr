@@ -24,15 +24,27 @@ function fmtDate(str) {
 const SOURCE_STYLE = {
   pricecharting: 'bg-violet-500/10 text-violet-400 border-violet-500/20',
   manual:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  custom:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:          'bg-zinc-500/10 text-zinc-500 border-zinc-700',
   none:          'bg-zinc-500/10 text-zinc-600 border-zinc-800',
 };
 const SOURCE_LABEL = {
   pricecharting: 'Market value via PriceCharting',
   manual:        'Owner Estimated',
+  custom:        'Custom Value',
   mock:          'Mock Data',
   none:          'Not yet priced',
 };
+
+// Grade ladders for the edit form (mirrors the add form)
+const GENERIC_GRADES = ['1', '1.5', '2', '2.5', '3', '3.5', '4', '4.5', '5', '5.5', '6', '6.5', '7', '7.5', '8', '8.5', '9', '9.5', '10'];
+const GRADE_OPTIONS = {
+  PSA: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+  BGS: [...GENERIC_GRADES, '10 Black Label'],
+  SGC: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '9.5', '10'],
+  CGC: ['0.5', ...GENERIC_GRADES],
+};
+const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
 
 const EBAY_ATTRIBUTION_STYLE = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
 
@@ -110,6 +122,20 @@ export default function Item() {
   // Which grade line(s) the chart shows — null resolves to the user's grade
   // bucket once market data loads ('All' shows every line)
   const [gradeView, setGradeView] = useState(null);
+
+  // Active Listings: collapsed shows 3, expanded shows all
+  const [showAllListings, setShowAllListings] = useState(false);
+
+  // Per-user custom image upload
+  const [uploadingImg, setUploadingImg] = useState(false);
+  const [imgMsg, setImgMsg]             = useState(null);
+  const fileInputRef = useRef(null);
+
+  // Custom valuation panel
+  const [customValOpen, setCustomValOpen]     = useState(false);
+  const [customValInput, setCustomValInput]   = useState('');
+  const [customValSaving, setCustomValSaving] = useState(false);
+  const [customValError, setCustomValError]   = useState('');
 
   // Inline name editing
   const [editingName, setEditingName]               = useState(false);
@@ -262,6 +288,105 @@ export default function Item() {
     }
   }
 
+  // ── Per-user custom image ─────────────────────────────────────────────────
+  function handleImageUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const ALLOWED = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    if (!ALLOWED.includes(file.type)) {
+      setImgMsg('Only JPEG, PNG, and WebP images are accepted');
+      setTimeout(() => setImgMsg(null), 4000);
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setImgMsg('Image too large — maximum 5MB');
+      setTimeout(() => setImgMsg(null), 4000);
+      e.target.value = '';
+      return;
+    }
+
+    setUploadingImg(true);
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const res = await fetch(`${API}/api/portfolio/${id}/image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ image_base64: event.target.result }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          setItem(prev => ({ ...prev, image_url: data.image_url, has_custom_image: true }));
+          setImgMsg('Custom image saved ✓');
+        } else {
+          setImgMsg(data.error ?? 'Image update failed — please try again');
+        }
+      } catch {
+        setImgMsg('Image update failed — please try again');
+      } finally {
+        setUploadingImg(false);
+        setTimeout(() => setImgMsg(null), 4000);
+        e.target.value = '';
+      }
+    };
+    reader.onerror = () => {
+      setImgMsg('Image update failed — please try again');
+      setUploadingImg(false);
+      setTimeout(() => setImgMsg(null), 4000);
+      e.target.value = '';
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function handleRemoveCustomImage() {
+    setUploadingImg(true);
+    try {
+      const res = await fetch(`${API}/api/portfolio/${id}/image`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setItem(prev => ({ ...prev, image_url: data.image_url, has_custom_image: false }));
+        setImgMsg('Reverted to the default image');
+      } else {
+        setImgMsg(data.error ?? 'Could not remove the custom image');
+      }
+    } catch {
+      setImgMsg('Could not remove the custom image');
+    } finally {
+      setUploadingImg(false);
+      setTimeout(() => setImgMsg(null), 4000);
+    }
+  }
+
+  // ── Per-item custom valuation ─────────────────────────────────────────────
+  async function applyCustomValue(mode, value) {
+    setCustomValSaving(true);
+    setCustomValError('');
+    try {
+      const res = await fetch(`${API}/api/portfolio/${id}/custom-value`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ mode, value }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setCustomValError(data.error ?? 'Could not set the custom value');
+        return;
+      }
+      setItem(prev => ({ ...prev, custom_value: data.custom_value }));
+      setCustomValOpen(false);
+      setCustomValInput('');
+    } catch {
+      setCustomValError('Network error — please try again');
+    } finally {
+      setCustomValSaving(false);
+    }
+  }
+
   async function handleSaveManualValue() {
     const val = parseFloat(manualValueInput);
     if (isNaN(val) || val <= 0) return;
@@ -353,7 +478,8 @@ export default function Item() {
   // display "—" instead of a misleading negative number.
   const displayValue = (() => {
     if (isOneOfOne) return item.manual_value != null ? parseFloat(item.manual_value) : null;
-    const raw = item.current_value ?? item.ph_value;
+    // Per-user custom valuation overrides the market value for this item only
+    const raw = item.custom_value ?? item.current_value ?? item.ph_value;
     if (raw == null) return null;
     const v = parseFloat(raw);
     return !isNaN(v) && v > 0 ? v : null;
@@ -369,7 +495,10 @@ export default function Item() {
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
   // 'none' = no price history at all (new scan, not yet priced or no eBay results)
   // 'mock' = has a seeded mock price_history row
-  const src        = isOneOfOne ? 'manual' : (item.price_source ?? 'none');
+  // 'custom' = the user set their own valuation for this item
+  const src        = isOneOfOne ? 'manual'
+                   : item.custom_value != null ? 'custom'
+                   : (item.price_source ?? 'none');
   const gradeLabel = item.condition === 'graded' && (item.grading_company || item.grade)
     ? [item.grading_company, item.grade].filter(Boolean).join(' ')
     : item.condition === 'raw' ? 'Raw' : null;
@@ -446,6 +575,35 @@ export default function Item() {
               }
             </div>
 
+            {/* Custom image controls — per-user, never touches the catalog */}
+            <div className="flex flex-col items-center gap-1">
+              <div className="flex gap-2 w-full">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploadingImg}
+                  className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {uploadingImg ? 'Working…' : '↑ Update Image'}
+                </button>
+                {item.has_custom_image && (
+                  <button
+                    onClick={handleRemoveCustomImage}
+                    disabled={uploadingImg}
+                    className="flex-1 py-1.5 px-3 text-xs rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-red-400 hover:border-red-500/40 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Remove custom image
+                  </button>
+                )}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/jpg,image/png,image/webp"
+                  className="hidden"
+                  onChange={handleImageUpload}
+                />
+              </div>
+              {imgMsg && <p className="text-xs text-zinc-500">{imgMsg}</p>}
+            </div>
 
             {/* Identity */}
             <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-4">
@@ -497,11 +655,18 @@ export default function Item() {
                   )}
                   {item.set_name && <p className="text-zinc-400 text-sm mt-0.5">{item.set_name}</p>}
                 </div>
-                {gradeLabel && (
-                  <span className="shrink-0 bg-indigo-500/20 text-indigo-300 text-xs font-bold px-2.5 py-1 rounded-full">
-                    {gradeLabel}
-                  </span>
-                )}
+                <div className="shrink-0 flex items-center gap-1.5">
+                  {gradeLabel && (
+                    <span className="bg-indigo-500/20 text-indigo-300 text-xs font-bold px-2.5 py-1 rounded-full">
+                      {gradeLabel}
+                    </span>
+                  )}
+                  {item.serial_number && (
+                    <span className="bg-emerald-500/15 text-emerald-300 text-xs font-bold px-2.5 py-1 rounded-full">
+                      #{String(item.serial_number).replace(/^#/, '')}
+                    </span>
+                  )}
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
@@ -682,7 +847,7 @@ export default function Item() {
                           }`}
                         >
                           <span className="w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[label] ?? '#10b981' }} />
-                          {label}{market?.user_tier === label ? ' · yours' : ''}
+                          {label}
                         </span>
                       ))}
                     </div>
@@ -708,7 +873,7 @@ export default function Item() {
                               <tr key={g.grade} className={g.is_user_grade ? 'text-white font-semibold' : 'text-zinc-400'}>
                                 <td className="py-1">
                                   <span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[g.grade] ?? '#10b981' }} />
-                                  {g.grade}{g.is_user_grade ? ' · yours' : ''}
+                                  {g.grade}
                                 </td>
                                 <td className="text-right py-1">{fmt$(g.current)}</td>
                                 <td className={`text-right py-1 ${g.change > 0 ? 'text-emerald-400' : g.change < 0 ? 'text-red-400' : 'text-zinc-600'}`}>
@@ -780,6 +945,66 @@ export default function Item() {
                   <span className="text-zinc-600 text-xs">Updated {fmtDate(item.price_updated_at)}</span>
                 )}
               </div>
+
+              {/* Custom valuation — affects only this user's item */}
+              {!isOneOfOne && (
+                <div className="pt-1">
+                  {!customValOpen ? (
+                    <div className="flex items-center gap-4">
+                      <button
+                        onClick={() => { setCustomValOpen(true); setCustomValInput(item.custom_value != null ? String(item.custom_value) : ''); setCustomValError(''); }}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 transition"
+                      >
+                        {item.custom_value != null ? 'Edit custom value' : 'Set Custom Value'}
+                      </button>
+                      {item.custom_value != null && (
+                        <button
+                          onClick={() => applyCustomValue('clear')}
+                          disabled={customValSaving}
+                          className="text-xs text-zinc-600 hover:text-red-400 transition disabled:opacity-50"
+                        >
+                          Clear custom value
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <button
+                        onClick={() => applyCustomValue('recent_sale')}
+                        disabled={customValSaving}
+                        className="w-full text-left text-xs px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-300 hover:border-indigo-500/50 transition disabled:opacity-50"
+                      >
+                        Use most recent sale{gradeLabel ? ` for ${gradeLabel}` : ''}
+                      </button>
+                      <div className="flex gap-2">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={customValInput}
+                          onChange={e => setCustomValInput(e.target.value)}
+                          placeholder="Enter my own value ($)"
+                          className="flex-1 min-w-0 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-white text-xs focus:outline-none focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={() => applyCustomValue('manual', parseFloat(customValInput))}
+                          disabled={customValSaving || !customValInput}
+                          className="text-xs px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 transition disabled:opacity-50"
+                        >
+                          {customValSaving ? 'Saving…' : 'Save'}
+                        </button>
+                        <button
+                          onClick={() => { setCustomValOpen(false); setCustomValError(''); }}
+                          className="text-xs px-3 py-2 rounded-lg border border-zinc-700 text-zinc-500 hover:text-zinc-300 transition"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                      {customValError && <p className="text-red-400 text-xs">{customValError}</p>}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Recent Sales — follows the chart's grade selector */}
@@ -867,7 +1092,7 @@ export default function Item() {
               ) : (
                 <>
                   <div className="space-y-2.5">
-                    {listings.map((l, i) => (
+                    {(showAllListings ? listings : listings.slice(0, 3)).map((l, i) => (
                       <div key={i} className="flex items-center gap-3 bg-zinc-950/60 border border-zinc-800 rounded-xl p-3">
                         <div className="w-12 h-12 rounded-lg bg-zinc-800 overflow-hidden shrink-0 flex items-center justify-center">
                           {l.image ? (
@@ -906,12 +1131,20 @@ export default function Item() {
                       </div>
                     ))}
                   </div>
+                  {listings.length > 3 && (
+                    <button
+                      onClick={() => setShowAllListings(v => !v)}
+                      className="block w-full text-center mt-3 text-xs text-zinc-400 hover:text-white border border-zinc-800 hover:border-zinc-600 rounded-lg py-1.5 transition"
+                    >
+                      {showAllListings ? 'Show less' : `Show more (${listings.length - 3} more)`}
+                    </button>
+                  )}
                   {listingsMeta?.ebay_search_url && (
                     <a
                       href={listingsMeta.ebay_search_url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="block text-center mt-4 text-xs text-indigo-400 hover:text-indigo-300 transition"
+                      className="block text-center mt-3 text-xs text-indigo-400 hover:text-indigo-300 transition"
                     >
                       View all on eBay ↗
                     </a>
@@ -1022,14 +1255,22 @@ export default function Item() {
               <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="text-zinc-500 text-xs block mb-1">Grading Co.</label>
-                  <select value={editForm.grading_company} onChange={setField('grading_company')} className={INPUT}>
+                  <select
+                    value={editForm.grading_company}
+                    // Changing company resets the grade — ladders differ
+                    onChange={e => setEditForm(f => ({ ...f, grading_company: e.target.value, grade: '' }))}
+                    className={INPUT}
+                  >
                     <option value="">—</option>
                     {['PSA','BGS','CGC','SGC'].map(g => <option key={g} value={g}>{g}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="text-zinc-500 text-xs block mb-1">Grade</label>
-                  <input type="text" value={editForm.grade} onChange={setField('grade')} placeholder="10" className={INPUT} />
+                  <select value={editForm.grade} onChange={setField('grade')} className={INPUT}>
+                    <option value="">—</option>
+                    {gradesFor(editForm.grading_company).map(g => <option key={g} value={g}>{g}</option>)}
+                  </select>
                 </div>
                 <div>
                   <label className="text-zinc-500 text-xs block mb-1">Cert #</label>

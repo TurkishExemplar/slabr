@@ -125,6 +125,16 @@ CREATE TABLE IF NOT EXISTS app_meta (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Phase 15: per-item personalization
+-- serial_number: card serial / print run ("23/99", "1/1")
+-- custom_image:  user-uploaded photo shown instead of the catalog image,
+--                only for this user's portfolio item
+-- custom_value:  user-set valuation (manual or most-recent-sale) that
+--                overrides current_value for this item only
+ALTER TABLE portfolio_items ADD COLUMN IF NOT EXISTS serial_number TEXT;
+ALTER TABLE portfolio_items ADD COLUMN IF NOT EXISTS custom_image TEXT;
+ALTER TABLE portfolio_items ADD COLUMN IF NOT EXISTS custom_value NUMERIC(12,2);
+
 -- Phase 14: PriceCharting sold listings per grade tier (scraped from the
 -- product page's completed-auctions tables; listing_id dedupes re-syncs)
 CREATE TABLE IF NOT EXISTS pc_sales (

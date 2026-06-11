@@ -117,7 +117,9 @@ router.get('/:username', async (req, res) => {
          pi.id, pi.catalog_id, pi.condition, pi.grading_company, pi.grade,
          pi.cert_number, pi.quantity, pi.current_value, pi.added_at,
          mc.item_type, mc.name, mc.year, mc.brand_publisher, mc.set_name,
-         mc.card_number, mc.variation, mc.sport_game, mc.rarity, mc.image_url,
+         mc.card_number, mc.variation, mc.sport_game, mc.rarity,
+         COALESCE(pi.custom_image, mc.image_url) AS image_url,
+         pi.serial_number,
          ph.sold_median AS ph_value,
          ph.source      AS price_source
        FROM portfolio_items pi

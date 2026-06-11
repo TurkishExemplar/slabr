@@ -41,11 +41,12 @@ const TYPE_BADGE = {
 const PRICE_SOURCE_STYLE = {
   pricecharting: 'bg-violet-500/10 text-violet-400 border-violet-500/20',
   manual:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  custom:        'bg-amber-500/10 text-amber-400 border-amber-500/20',
   mock:          'bg-zinc-500/10 text-zinc-500 border-zinc-700',
   none:          'bg-zinc-500/10 text-zinc-600 border-zinc-800',
 };
 
-const PRICE_SOURCE_LABEL = { pricecharting: 'PriceCharting', manual: 'Owner Est.', mock: 'Mock Data', none: 'Not priced' };
+const PRICE_SOURCE_LABEL = { pricecharting: 'PriceCharting', manual: 'Owner Est.', custom: 'Custom Value', mock: 'Mock Data', none: 'Not priced' };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +69,8 @@ function effectiveValue(item) {
   if (item.is_one_of_one && item.manual_value != null) {
     return parseFloat(item.manual_value);
   }
-  const raw = item.current_value ?? item.ph_value;
+  // Per-user custom valuation overrides the market value for this item only
+  const raw = item.custom_value ?? item.current_value ?? item.ph_value;
   if (raw == null) return null;
   const v = parseFloat(raw);
   return !isNaN(v) && v > 0 ? v : null;
@@ -613,7 +615,9 @@ function ItemCard({ item }) {
   const gain       = totalValue != null && totalCost != null && totalCost > 0
     ? totalValue - totalCost : null;
   const gainPct    = gain != null && totalCost > 0 ? (gain / totalCost) * 100 : null;
-  const src        = item.is_one_of_one ? 'manual' : (item.price_source ?? 'none');
+  const src        = item.is_one_of_one ? 'manual'
+                   : item.custom_value != null ? 'custom'
+                   : (item.price_source ?? 'none');
 
   return (
     <Link to={`/item/${item.id}`} className="block bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden hover:border-zinc-700 transition">
@@ -661,11 +665,20 @@ function ItemCard({ item }) {
           {item.set_name && <p className="text-zinc-500 text-xs mt-0.5">{item.set_name}</p>}
         </div>
 
-        {/* Grade badge */}
-        {item.condition === 'graded' && (item.grading_company || item.grade) && (
-          <span className="inline-block bg-indigo-500/20 text-indigo-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
-            {[item.grading_company, item.grade].filter(Boolean).join(' ')}
-          </span>
+        {/* Grade + serial badges */}
+        {(item.serial_number || (item.condition === 'graded' && (item.grading_company || item.grade))) && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {item.condition === 'graded' && (item.grading_company || item.grade) && (
+              <span className="inline-block bg-indigo-500/20 text-indigo-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                {[item.grading_company, item.grade].filter(Boolean).join(' ')}
+              </span>
+            )}
+            {item.serial_number && (
+              <span className="inline-block bg-emerald-500/15 text-emerald-300 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                #{String(item.serial_number).replace(/^#/, '')}
+              </span>
+            )}
+          </div>
         )}
 
         {/* Pricing */}

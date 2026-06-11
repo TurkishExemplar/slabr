@@ -20,8 +20,6 @@ function itemTypeFromHint(hint) {
 }
 
 // Find an existing master_catalog row or auto-insert one.
-// scanImageBase64: data-URL from the scan photo — stored as a temporary
-// image_url until priceSingleItem replaces it with a real eBay CDN image.
 //
 // Lookup strategy (most-specific → least-specific):
 //   1. name + set_name + year   — prevents matching a different card that shares
@@ -29,7 +27,7 @@ function itemTypeFromHint(hint) {
 //   2. name + set_name           — year not extracted from label
 //   3. full name only            — only safe when name includes set info
 //   4. auto-create               — nothing matched
-async function resolveCatalogId(fields, scanImageBase64 = null) {
+async function resolveCatalogId(fields) {
   const { item_type, name, set_name, card_number, year, sport_game, rarity } = fields;
   if (!name) return null;
 
@@ -82,17 +80,9 @@ async function resolveCatalogId(fields, scanImageBase64 = null) {
     id = r.rows[0].id;
   }
 
-  // ── Temporary image from scan photo ──────────────────────────────────────
-  // Store the scan photo as a data-URI so the card shows an image immediately.
-  // Accept up to 8 MB of base64 (covers standard phone-camera JPEGs at normal
-  // quality settings).  eBay's priceSingleItem job will overwrite this with a
-  // proper CDN URL once the background pricing run completes.
-  if (scanImageBase64 && id && scanImageBase64.length <= 8_000_000) {
-    await pool.query(
-      `UPDATE master_catalog SET image_url = $1 WHERE id = $2 AND image_url IS NULL`,
-      [scanImageBase64, id]
-    );
-  }
+  // The scan photo is used ONLY for identification — never saved as the card
+  // image.  The PriceCharting product image is fetched by the background
+  // pricing run right after the item is added.
 
   return id;
 }
@@ -337,9 +327,7 @@ router.post('/', scanLimiter, async (req, res) => {
       confidence:      typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
     };
 
-    // Pass the scan photo so resolveCatalogId can save it as a temporary
-    // image_url (replaced by a real eBay CDN URL once priceSingleItem runs).
-    const catalog_id = await resolveCatalogId({ ...identified, item_type: derivedType }, image_base64);
+    const catalog_id = await resolveCatalogId({ ...identified, item_type: derivedType });
 
     res.json({ match: true, catalog_id, ...identified });
 
