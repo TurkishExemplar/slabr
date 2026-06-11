@@ -348,6 +348,22 @@ router.get('/:id/market', async (req, res) => {
       };
     });
 
+    // ── Recent sales per grade (for the chart's grade selector) ──────────
+    const { rows: allSales } = await pool.query(`
+      SELECT date, grade_label, price, title, url FROM (
+        SELECT sold_date::text AS date, grade_label, price, title, url,
+               ROW_NUMBER() OVER (PARTITION BY grade_label ORDER BY sold_date DESC) AS rn
+        FROM pc_sales
+        WHERE catalog_id = $1 AND grade_label IS NOT NULL
+      ) t
+      WHERE rn <= 15
+      ORDER BY grade_label, date DESC
+    `, [item.catalog_id]);
+    const salesByGrade = {};
+    for (const s of allSales) {
+      (salesByGrade[s.grade_label] ??= []).push({ ...s, price: parseFloat(s.price) });
+    }
+
     // ── Sold listings for the user's bucket ──────────────────────────────
     const { rows: bucketSales } = await pool.query(`
       SELECT sold_date::text AS date, grade_label, price, title, url
@@ -379,6 +395,7 @@ router.get('/:id/market', async (req, res) => {
       grade_prices:     gradePrices,
       sales:            sales.slice(0, 30).map(s => ({ ...s, price: parseFloat(s.price) })),
       sales_filtered:   salesFiltered,
+      sales_by_grade:   salesByGrade,
     });
   } catch (err) {
     console.error('[portfolio GET /:id/market]', err.message);

@@ -212,7 +212,8 @@ export default function Item() {
       }
       if (used) series.push(label);
     }
-    series.sort((a, b) => gradeOrderKey(a) - gradeOrderKey(b));
+    // Best grades first — PSA 10 down to Ungraded
+    series.sort((a, b) => gradeOrderKey(b) - gradeOrderKey(a));
     const rows = [...rowsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     return { chartRows: rows, chartSeries: series };
   }, [market, priceHistory, range]);
@@ -224,6 +225,14 @@ export default function Item() {
   const visibleSeries = resolvedGradeView === 'All'
     ? chartSeries
     : chartSeries.filter(l => l === resolvedGradeView);
+
+  // Recent Sales follows the dropdown: a specific non-user grade shows that
+  // grade's sales; the user's own bucket (and 'All') keeps the half-grade
+  // filtered set from the server.
+  const showingUserSales = resolvedGradeView === 'All' || resolvedGradeView === market?.user_bucket;
+  const shownSales = showingUserSales
+    ? (market?.sales ?? [])
+    : (market?.sales_by_grade?.[resolvedGradeView] ?? []);
 
   async function handleSave() {
     setSaving(true);
@@ -679,7 +688,7 @@ export default function Item() {
                     </div>
                   )}
 
-                  {/* Grade price table */}
+                  {/* Grade price table — follows the dropdown selection */}
                   {market?.grade_prices?.length > 0 && (
                     <div className="mt-4 border-t border-zinc-800 pt-3">
                       <table className="w-full text-xs">
@@ -693,7 +702,8 @@ export default function Item() {
                         </thead>
                         <tbody>
                           {[...market.grade_prices]
-                            .sort((a, b) => gradeOrderKey(a.grade) - gradeOrderKey(b.grade))
+                            .filter(g => resolvedGradeView === 'All' || g.grade === resolvedGradeView)
+                            .sort((a, b) => gradeOrderKey(b.grade) - gradeOrderKey(a.grade))
                             .map(g => (
                               <tr key={g.grade} className={g.is_user_grade ? 'text-white font-semibold' : 'text-zinc-400'}>
                                 <td className="py-1">
@@ -772,8 +782,8 @@ export default function Item() {
               </div>
             </div>
 
-            {/* Recent Sales — sold listings for this item's grade */}
-            {market?.sales?.length > 0 && (
+            {/* Recent Sales — follows the chart's grade selector */}
+            {(shownSales.length > 0 || market?.sales?.length > 0) && (
               <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
                 <div className="flex items-center justify-between mb-1">
                   <p className="text-zinc-400 text-xs font-medium uppercase tracking-wider">Recent Sales</p>
@@ -782,15 +792,19 @@ export default function Item() {
                   </span>
                 </div>
                 <p className="text-zinc-600 text-xs mb-3">
-                  Last {market.sales.length} sales
-                  {market.user_bucket !== market.user_tier
-                    ? (market.sales_filtered
-                        ? ` · ${market.user_bucket} bucket, filtered to ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
-                        : ` · ${market.user_bucket} bucket (no exact ${[item.grading_company, item.grade].filter(Boolean).join(' ')} listings)`)
-                    : ` · ${market.user_tier}`}
+                  {!showingUserSales
+                    ? `Last ${shownSales.length} sales · ${resolvedGradeView}`
+                    : `Last ${shownSales.length} sales` + (market.user_bucket !== market.user_tier
+                        ? (market.sales_filtered
+                            ? ` · ${market.user_bucket} bucket, filtered to ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
+                            : ` · ${market.user_bucket} bucket (no exact ${[item.grading_company, item.grade].filter(Boolean).join(' ')} listings)`)
+                        : ` · ${market.user_tier}`)}
                 </p>
+                {shownSales.length === 0 && (
+                  <p className="text-zinc-600 text-sm py-3 text-center">No recorded sales for {resolvedGradeView}</p>
+                )}
                 <div className="divide-y divide-zinc-800 max-h-80 overflow-y-auto">
-                  {market.sales.map((s, i) => (
+                  {shownSales.map((s, i) => (
                     <div key={i} className="flex items-center gap-3 py-2">
                       <span className="text-zinc-600 text-xs w-20 shrink-0">{s.date}</span>
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 shrink-0">
