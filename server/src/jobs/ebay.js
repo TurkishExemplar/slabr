@@ -484,8 +484,13 @@ const PC_JUNK_CONSOLE_RE = /\bfunko\b|\bpop!/i;
 // Score how well a PriceCharting product matches our item.
 // console-name carries the set/year ("Basketball Cards 1986 Fleer"),
 // product-name carries the card number ("Michael Jordan #57").
-// A WRONG card number is heavily penalized — a junk-wax-era Jordan #29
-// must never price a 1986 Fleer Jordan #57.
+//
+// Set words that are MISSING from the console count against the match — a
+// search for "Donruss Optic Downtown" must never settle for base Donruss
+// Optic when the Downtown insert isn't in PC's database at all.  Numeric
+// tokens (e.g. "1986-87") are exempt from the penalty since consoles write
+// seasons differently.  A DIFFERENT card number is near-disqualifying:
+// base Optic #23 is not Downtown #DT-23.
 function scorePcProduct(product, year, set_name, card_number) {
   const consoleName = (product['console-name'] ?? '').toLowerCase();
   const productName = (product['product-name'] ?? '').toLowerCase();
@@ -494,40 +499,42 @@ function scorePcProduct(product, year, set_name, card_number) {
   if (set_name) {
     const setParts = set_name.toLowerCase().split(/\s+/);
     for (const part of setParts) {
-      if (part.length > 2 && consoleName.includes(part)) score += 2;
+      if (part.length <= 2) continue;
+      if (consoleName.includes(part)) {
+        score += 2;
+      } else if (!/^\d/.test(part)) {
+        score -= 2;
+      }
     }
   }
   if (card_number) {
     const cn = String(card_number).toLowerCase();
     const m  = productName.match(/#\s*([a-z0-9-]+)/i);
-    if (m) score += m[1].toLowerCase() === cn ? 4 : -4;
+    if (m) score += m[1].toLowerCase() === cn ? 4 : -8;
   }
   return score;
 }
 
 // ── Grade → PriceCharting price selection ─────────────────────────────────────
-// SportsCardsPro grade-specific price fields (cents; 0 = no data):
-//   loose-price        = raw / ungraded
-//   cib-price          = PSA 8 / BGS 9 equivalent
-//   graded-price       = PSA 9 / BGS 9.5 equivalent (near mint)
-//   condition-17-price = PSA 10 / BGS 10
-//   condition-18-price = BGS 10 Black Label
+// EMPIRICALLY CONFIRMED field ↔ grade mapping — validated by matching live
+// production API values against the labeled grade columns on the
+// pricecharting.com product page for 2003 Topps Chrome LeBron James #111:
 //
-// Half grades (7.5 / 8.5 / 9.5) fall BETWEEN those tiers and consistently
-// trade above the lower tier, so they interpolate — the price is the average
-// of the two surrounding tier prices:
+//   loose-price        = Ungraded     ($1,417 on the reference card)
+//   cib-price          = Grade 7      ($1,266)
+//   new-price          = Grade 8      ($1,873)
+//   graded-price       = Grade 9      ($2,997.50 — exact match to the API)
+//   box-only-price     = Grade 9.5    ($4,422)
+//   manual-only-price  = PSA 10       ($12,293 — matches its PSA 10 sales)
+//   condition-17/18-price = SGC 10 / CGC 10 / BGS 10 tiers (exact per-company
+//     assignment unconfirmed — compare all_price_fields in the admin test
+//     endpoint against the product page's labeled 10s columns)
 //
-//   PSA / SGC: 10 → c17 | 9.5 → avg(graded, c17) | 9 → graded
-//              8.5 → avg(cib, graded) | 8 → cib | 7.5 → avg(loose, cib)
-//              ≤7 → loose
-//   BGS:       10 → c17 (c18 fallback) | 9.5 → graded (tier definition)
-//              9 → cib | 8.5 → avg(cib, graded) | 8 → cib
-//              7.5 → avg(loose, cib) | ≤7 → loose
-//
-// The 8.5 interpolation is CLAMPED to 40–60% of the graded tier: cib and
-// graded sit far apart on iconic cards and a plain midpoint overshoots what
-// 8.5s actually realize.  (Grade-specific SCP products, when they exist, are
-// preferred over any interpolation — see pcGradeSpecificLookup.)
+// Grade tiers below 10 are company-agnostic (PC infers the grade from listing
+// titles), so PSA/BGS/SGC share the 7/8/9/9.5 ladder.  Half grades now sit
+// between ADJACENT grade tiers, so a plain average is accurate — the old
+// 40-60% clamp existed only because the previous (wrong) ladder averaged
+// tiers two whole grades apart.
 //
 // When one side of an average has no data, the available side is used alone;
 // exact tiers fall back down the ladder when their field is empty.
@@ -552,65 +559,79 @@ function pcPriceForGrade(product, item) {
   if (condition !== 'graded') return single('loose-price');
 
   const g = parseFloat(grade);
-  if (isNaN(g)) return single('graded-price', 'cib-price'); // graded, but grade unknown
+  if (isNaN(g)) return single('graded-price', 'new-price'); // graded, but grade unknown
 
-  const isBgs = ['BGS', 'BECKETT'].includes((grading_company ?? 'PSA').toUpperCase());
+  const co = (grading_company ?? 'PSA').toUpperCase() === 'BECKETT'
+    ? 'BGS'
+    : (grading_company ?? 'PSA').toUpperCase();
 
-  if (g >= 10)  return single('condition-17-price', 'condition-18-price', 'graded-price');
-  if (g >= 9.5) return isBgs ? single('graded-price')                  // BGS 9.5 IS the graded tier
-                             : avg('graded-price', 'condition-17-price');
-  if (g >= 9)   return isBgs ? single('cib-price')                     // BGS 9 ≈ PSA 8 tier
-                             : single('graded-price');
-  if (g >= 8.5) {
-    const graded = val('graded-price');
-    const cib    = val('cib-price');
-    // Clamp interpolated 8.5s into a 40–60% band of the graded tier; the
-    // lower bound never drops below the cib (8) tier so an 8.5 can't price
-    // under an 8 when the tiers sit close together.
-    if (graded != null && cib != null) {
-      const mid   = Math.round((cib + graded) / 2);
-      const floor = Math.max(Math.round(graded * 0.40), cib);
-      const ceil  = Math.max(Math.round(graded * 0.60), floor);
-      const cents = Math.min(Math.max(mid, floor), ceil);
-      return {
-        cents,
-        field: cents === mid
-          ? 'avg(cib-price, graded-price)'
-          : 'avg(cib-price, graded-price) clamped to 40-60% of graded-price',
-      };
-    }
-    // Only the graded (9) tier has data — an 8.5 must never price at the
-    // full 9-tier value, so the 60% ceiling applies directly.
-    if (graded != null) return { cents: Math.round(graded * 0.60), field: 'graded-price scaled to 60% (8.5 ceiling)' };
-    if (cib    != null) return { cents: cib, field: 'cib-price' };
-    return single('loose-price');
+  if (g >= 10) {
+    // PSA 10 = manual-only-price (confirmed).  Other companies' 10s live in
+    // the condition-17/18 fields; fall back toward the PSA 10 / 9.5 tiers
+    // when those are empty rather than returning nothing.
+    return co === 'PSA'
+      ? single('manual-only-price', 'box-only-price')
+      : single('condition-17-price', 'condition-18-price', 'manual-only-price', 'box-only-price');
   }
-  if (g >= 8)   return single('cib-price');
-  if (g >= 7.5) return avg('loose-price', 'cib-price');
-  return single('loose-price');                                        // 7 and below ≈ raw floor
+  if (g >= 9.5) return single('box-only-price', 'graded-price'); // Grade 9.5 tier
+  if (g >= 9)   return single('graded-price');                   // Grade 9
+  if (g >= 8.5) return avg('new-price', 'graded-price');         // between 8 and 9
+  if (g >= 8)   return single('new-price');                      // Grade 8
+  if (g >= 7.5) return avg('cib-price', 'new-price');            // between 7 and 8
+  if (g >= 7)   return single('cib-price');                      // Grade 7
+  return single('loose-price');                                  // below 7 ≈ raw floor
 }
 
 // Image-field candidates seen across PriceCharting/SportsCardsPro product
 // responses — the API does not document an image field, so probe broadly.
 const PC_IMAGE_FIELDS = ['image', 'image-url', 'image_url', 'photo', 'photo-url', 'cover-url', 'boxart-url'];
 
-// Extract a card image from a PriceCharting product response.  Falls back to
-// the predictable images CDN path, validated with a HEAD request so a wrong
-// guess can never save a broken URL.  Returns null when no image exists —
-// callers keep the item's current image in that case.
-// Pass { cdnFallback: false } in latency-sensitive paths (typeahead search)
-// to skip the HEAD probe.
-async function pcProductImage(product, { cdnFallback = true } = {}) {
+// Extract a card image from a PriceCharting product response — explicit image
+// fields only (the API rarely sets any).  The real image lives on the product
+// PAGE at storage.googleapis.com/images.pricecharting.com/<hash>/1600.jpg,
+// where <hash> is NOT derivable from the product id — see fetchPcPageImage.
+function pcProductImage(product) {
   for (const f of PC_IMAGE_FIELDS) {
     const v = product[f];
     if (typeof v === 'string' && /^https?:\/\//.test(v)) return v;
   }
-  if (!cdnFallback || !product.id) return null;
-  const cdnUrl = `https://commondatastorage.googleapis.com/images.pricecharting.com/${product.id}/1600.jpg`;
+  return null;
+}
+
+// Resolve a product's real image by fetching its page: /game/<id> 301s to the
+// canonical slug page, which embeds the storage.googleapis.com image URL.
+// Results (including misses) are cached for the process lifetime — repeat
+// searches and refreshes cost nothing.  Returns null when the card has no
+// photo or PC's bot protection blocks the host (logged, graceful).
+const _pcImageCache = new Map();
+const PC_PAGE_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+
+async function fetchPcPageImage(productId) {
+  const id = String(productId ?? '');
+  if (!/^\d+$/.test(id)) return null;
+  if (_pcImageCache.has(id)) return _pcImageCache.get(id);
+
   try {
-    const head = await fetch(cdnUrl, { method: 'HEAD', signal: AbortSignal.timeout(6_000) });
-    if (head.ok && (head.headers.get('content-type') ?? '').startsWith('image/')) return cdnUrl;
-  } catch (_) { /* no CDN image */ }
+    const resp = await fetch(`https://www.pricecharting.com/game/${id}`, {
+      redirect: 'follow',
+      headers: { 'User-Agent': PC_PAGE_UA },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      const m = html.match(/https:\/\/storage\.googleapis\.com\/images\.pricecharting\.com\/([a-z0-9]+)\/\d+\.jpg/i);
+      const image = m ? `https://storage.googleapis.com/images.pricecharting.com/${m[1]}/1600.jpg` : null;
+      // Cache definitive answers only — a 200 page either has the photo or
+      // the card genuinely has none.
+      _pcImageCache.set(id, image);
+      return image;
+    }
+    // 403/429 = bot protection or rate limiting — do NOT cache, a later
+    // (gentler) attempt may succeed.
+    console.warn(`[pricecharting] image page /game/${id} → HTTP ${resp.status} (not cached)`);
+  } catch (err) {
+    console.warn(`[pricecharting] image page /game/${id} failed: ${err.message} (not cached)`);
+  }
   return null;
 }
 
@@ -746,7 +767,7 @@ async function pcGradeSpecificLookup(baseUrl, item, token) {
       if (cents == null) continue;
 
       const price = parseFloat((cents / 100).toFixed(2));
-      const image = await pcProductImage(product);
+      const image = pcProductImage(product) ?? await fetchPcPageImage(best.id);
       console.log(`[pricecharting] ${host} grade-specific matched: "${product['product-name']}" | ${product['console-name'] ?? '?'} — $${price} via "${q}"`);
       return {
         price,
@@ -792,7 +813,7 @@ async function pcLookupOnBase(baseUrl, item, token) {
           const priced = pcPriceForGrade(product, item);
           if (priced != null) {
             const price = parseFloat((priced.cents / 100).toFixed(2));
-            const image = await pcProductImage(product);
+            const image = pcProductImage(product) ?? await fetchPcPageImage(directId);
             console.log(`[pricecharting] ${host} direct-id ${directId} matched: "${product['product-name']}" | ${product['console-name'] ?? '?'} — $${price} from ${priced.field}`);
             return {
               price,
@@ -882,7 +903,7 @@ async function pcLookupOnBase(baseUrl, item, token) {
       const { cents, field } = priced;
 
       const price = parseFloat((cents / 100).toFixed(2));
-      const image = await pcProductImage(product);
+      const image = pcProductImage(product) ?? await fetchPcPageImage(best.id);
       console.log(`[pricecharting] ${tryTag} matched: "${product['product-name']}" | ${product['console-name'] ?? best['console-name'] ?? '?'} — $${price} from ${field}${image ? ' (+image)' : ''} via "${q}"`);
       return {
         price,
@@ -1304,13 +1325,13 @@ async function scpSearch(query, limit = 8) {
         const cents = (product['loose-price']  > 0 ? product['loose-price']  : null)
                    ?? (product['graded-price'] > 0 ? product['graded-price'] : null);
 
-        // Image: explicit API field first; otherwise the predictable CDN path
-        // UNVERIFIED (no HEAD probe — typeahead latency matters more).  The
-        // client hides broken guesses via onError, and pricing saves a
-        // verified image minutes later.
+        // Image: explicit API field first, then the real image scraped from
+        // the product page (process-cached).  Page fetches are limited to the
+        // top few results — PC rate-limits bursts, and a blocked burst would
+        // leave everything imageless anyway.
         const productId = String(product.id ?? p.id);
-        const image_url = (await pcProductImage(product, { cdnFallback: false }))
-          ?? `https://commondatastorage.googleapis.com/images.pricecharting.com/${productId}/1600.jpg`;
+        const image_url = pcProductImage(product)
+          ?? (idx < 3 ? await fetchPcPageImage(productId) : null);
 
         return {
           source:        'scp',
