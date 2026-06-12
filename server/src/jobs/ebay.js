@@ -619,10 +619,11 @@ function pcPriceForGrade(product, item) {
     : (grading_company ?? 'PSA').toUpperCase();
 
   if (g >= 10) {
-    // PSA 10 = manual-only-price (confirmed).  Other companies' 10s live in
-    // the condition-17/18 fields; fall back toward the PSA 10 / 9.5 tiers
-    // when those are empty rather than returning nothing.
-    return co === 'PSA'
+    // PSA 10 = manual-only-price (confirmed).  TAG 10s are treated like PSA
+    // 10s.  Other companies' 10s live in the condition-17/18 fields; fall
+    // back toward the PSA 10 / 9.5 tiers when those are empty rather than
+    // returning nothing.
+    return co === 'PSA' || co === 'TAG'
       ? single('manual-only-price', 'box-only-price')
       : single('condition-17-price', 'condition-18-price', 'manual-only-price', 'box-only-price');
   }
@@ -1099,10 +1100,14 @@ async function pcLookupOnBase(baseUrl, item, token) {
 // it's not a comp for a PSA 9.5.  BGS and Beckett are the same company.
 // company=null means RAW: no grading company may appear at all.
 const PC_COMPANY_RES = {
-  PSA:     /\bPSA\b/i,
-  BGS:     /\b(BGS|BECKETT)\b/i,
-  SGC:     /\bSGC\b/i,
-  CGC:     /\bCGC\b/i,
+  PSA:  /\bPSA\b/i,
+  BGS:  /\b(BGS|BECKETT)\b/i,
+  SGC:  /\bSGC\b/i,
+  CGC:  /\bCGC\b/i,
+  CBCS: /\bCBCS\b/i,
+  // TAG requires a following grade digit — "TAG 9" is a slab, "price tag" isn't
+  TAG:  /\bTAG\s*-?\s*(?=\d)/i,
+  PGX:  /\bPGX\b/i,
 };
 
 function titleMatchesCompany(title, company) {

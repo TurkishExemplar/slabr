@@ -16,7 +16,7 @@ const ITEM_SELECT = `
   pi.is_one_of_one, pi.manual_value, pi.manual_value_set_at,
   pi.serial_number, pi.custom_value,
   mc.item_type, mc.name, mc.year, mc.brand_publisher, mc.set_name,
-  mc.card_number, mc.variation, mc.sport_game, mc.rarity,
+  mc.card_number, mc.variation, mc.sport_game, mc.rarity, mc.ebay_item_id,
   COALESCE(pi.custom_image, mc.image_url) AS image_url,
   (pi.custom_image IS NOT NULL)           AS has_custom_image,
   ph.sold_median  AS ph_value,
@@ -282,7 +282,24 @@ router.get('/:id/market', async (req, res) => {
       if (isNaN(n)) return 'Graded';
       return n >= 10 ? 'PSA 10' : `Grade ${n}`;
     };
-    const userSeries = tierLabel(item.condition, item.grade);
+
+    // Comic-scale companies (CGC/CBCS/PGX) display everything in the
+    // company's own grade format — "CGC 8.5", never "Grade 8" buckets and
+    // never "PSA 10" on a comic.
+    const comicScale = item.condition === 'graded'
+      && ['CGC', 'CBCS', 'PGX'].includes((item.grading_company ?? '').toUpperCase());
+    const coName = item.grading_company;
+    const displayLabel = (label) => {
+      if (!comicScale || label === 'Ungraded') return label;
+      if (label === 'PSA 10') return `${coName} 10`;
+      const m = String(label).match(/^Grade (\d+(?:\.\d+)?)$/);
+      return m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : label;
+    };
+    const gradeExtractRe = comicScale
+      ? new RegExp(`${coName}\\s*-?\\s*(\\d{1,2}(?:\\.\\d)?)\\b`, 'i')
+      : null;
+
+    const userSeries = displayLabel(tierLabel(item.condition, item.grade));
 
     // ── Per-tier history series ───────────────────────────────────────────
     const { rows: hist } = await pool.query(`
@@ -309,19 +326,24 @@ router.get('/:id/market', async (req, res) => {
     // Lower grades (1–6) have no chart series on PriceCharting, but their
     // sold listings exist — derive monthly sale-medians so they chart too.
     // Only fills labels that don't already have a real tier series.
-    const tierSeriesLabels = new Set(Object.keys(historyByGrade));
-    const { rows: derived } = await pool.query(`
-      SELECT grade_label,
-             date_trunc('month', sold_date)::date::text AS date,
-             (percentile_cont(0.5) WITHIN GROUP (ORDER BY price))::numeric(12,2) AS value
-      FROM pc_sales
-      WHERE catalog_id = $1 AND grade_label IS NOT NULL
-      GROUP BY grade_label, date_trunc('month', sold_date)
-      ORDER BY grade_label, date_trunc('month', sold_date)
-    `, [item.catalog_id]);
-    for (const r of derived) {
-      if (tierSeriesLabels.has(r.grade_label)) continue;
-      (historyByGrade[r.grade_label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
+    // Skipped for comic-scale items: their sales are re-keyed by the EXACT
+    // grade in each title below, and bucket-level series would double-count
+    // the same sales under relabeled bucket names.
+    if (!comicScale) {
+      const tierSeriesLabels = new Set(Object.keys(historyByGrade));
+      const { rows: derived } = await pool.query(`
+        SELECT grade_label,
+               date_trunc('month', sold_date)::date::text AS date,
+               (percentile_cont(0.5) WITHIN GROUP (ORDER BY price))::numeric(12,2) AS value
+        FROM pc_sales
+        WHERE catalog_id = $1 AND grade_label IS NOT NULL
+        GROUP BY grade_label, date_trunc('month', sold_date)
+        ORDER BY grade_label, date_trunc('month', sold_date)
+      `, [item.catalog_id]);
+      for (const r of derived) {
+        if (tierSeriesLabels.has(r.grade_label)) continue;
+        (historyByGrade[r.grade_label] ??= []).push({ date: r.date, value: parseFloat(r.value) });
+      }
     }
 
     // ── Recent sales per grade (for the chart's grade selector) ──────────
@@ -335,7 +357,7 @@ router.get('/:id/market', async (req, res) => {
       WHERE rn <= 15
       ORDER BY grade_label, date DESC
     `, [item.catalog_id]);
-    const salesByGrade = {};
+    let salesByGrade = {};
     for (const s of allSales) {
       // Strict company filtering: a graded user sees only their company's
       // listings in every grade bucket; the Ungraded bucket never shows
@@ -361,6 +383,32 @@ router.get('/:id/market', async (req, res) => {
         if (exact.length) {
           salesByGrade[`Grade ${half}`] = exact;
           salesByGrade[floorLabel] = bucket.filter(s => !exact.includes(s));
+        }
+      }
+    }
+
+    // Comic-scale transform: re-key every sale by the EXACT grade in its
+    // title ("CGC 9.8"), relabel the tier series to the company format, and
+    // drop the sports-centric bucket labels entirely.
+    if (comicScale) {
+      const regrouped = {};
+      for (const [label, list] of Object.entries(salesByGrade)) {
+        for (const s of list) {
+          const m = (s.title ?? '').match(gradeExtractRe);
+          const key = m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : displayLabel(label);
+          (regrouped[key] ??= []).push({ ...s, grade_label: key });
+        }
+      }
+      for (const k of Object.keys(regrouped)) {
+        regrouped[k].sort((a, b) => b.date.localeCompare(a.date));
+      }
+      salesByGrade = regrouped;
+
+      for (const key of Object.keys(historyByGrade)) {
+        const nk = displayLabel(key);
+        if (nk !== key) {
+          historyByGrade[nk] = historyByGrade[key];
+          delete historyByGrade[key];
         }
       }
     }
@@ -418,6 +466,16 @@ router.get('/:id/market', async (req, res) => {
     // same filtered set.
     const comps = await getItemComps(item.catalog_id, item);
 
+    // Recent Sales badges show the EXACT grade from each title for
+    // comic-scale companies — never a bucket grade.
+    let compsSales = comps.sales;
+    if (comicScale) {
+      compsSales = comps.sales.map(s => {
+        const m = (s.title ?? '').match(gradeExtractRe);
+        return { ...s, grade_label: m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : displayLabel(s.grade_label) };
+      });
+    }
+
     // Human caption for the fallback case, in the company's own grade format:
     // "No CGC 8.5 sales found — showing CGC 8.0 and CGC 9.0 for reference"
     let compsNote = null;
@@ -428,12 +486,18 @@ router.get('/:id/market', async (req, res) => {
       compsNote = `No ${item.grading_company} ${item.grade} sales found — showing ${refs} for reference`;
     }
 
+    // For comic-scale items the selection default is the user's exact grade
+    // series when it has data, since bucket labels no longer exist as keys.
+    const bucketDisplay = comicScale
+      ? (salesByGrade[userSeries] || historyByGrade[userSeries] ? userSeries : displayLabel(userLabel))
+      : userLabel;
+
     res.json({
       user_tier:        userSeries,
-      user_bucket:      userLabel,
+      user_bucket:      bucketDisplay,
       history_by_grade: historyByGrade,
       grade_prices:     gradePrices,
-      sales:            comps.sales,
+      sales:            compsSales,
       sales_filtered:   comps.filtered,
       sales_median:     comps.median,
       comps_note:       compsNote,

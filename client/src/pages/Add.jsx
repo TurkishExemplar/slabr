@@ -16,7 +16,9 @@ const CATEGORY_LABELS = {
   sports_card: 'Sports', tcg: 'TCG', comic: 'Comics', sealed: 'Sealed',
 };
 
-const GRADING_COMPANIES = ['PSA', 'BGS', 'SGC', 'CGC', 'CBCS', 'PGX', 'CSG', 'HGA'];
+// Only companies SportsCardsPro carries data for — CSG/HGA slabs can be
+// added as Raw/Ungraded with a manual value instead.
+const GRADING_COMPANIES = ['PSA', 'BGS', 'SGC', 'CGC', 'CBCS', 'PGX', 'TAG'];
 
 const pillCls = active =>
   `text-[11px] px-2.5 py-1 rounded-full border transition ${active
@@ -34,7 +36,8 @@ const GRADE_OPTIONS = {
   SGC:  ['10', '9.5', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
   CGC:  CGC_SCALE,
   CBCS: CGC_SCALE,
-  PGX:  ['10', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.5', '1.0'],
+  PGX:  CGC_SCALE,
+  TAG:  ['10', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
 };
 const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
 
@@ -94,6 +97,10 @@ export default function Add() {
   const [searchSport, setSearchSport]         = useState('all');
   const [searchCondition, setSearchCondition] = useState('all');
   const [searchSort, setSearchSort]           = useState('high');
+
+  // What's already in the user's portfolio — search results that match get
+  // an "Already in collection" badge and a disabled add button.
+  const [owned, setOwned] = useState({ catalogIds: new Set(), scpIds: new Set() });
   const [registeringId, setRegisteringId] = useState(null); // ebay_item_id being registered
   const [selectedItem, setSelectedItem]   = useState(null);
   const [panelOpen, setPanelOpen]         = useState(false);
@@ -250,6 +257,26 @@ export default function Add() {
     }, 350);
     return () => { clearTimeout(t); ctrl.abort(); };
   }, [query, searchCategory, searchSport, searchCondition]);
+
+  // Load the user's portfolio once to mark already-owned search results
+  useEffect(() => {
+    fetch(`${API}/api/portfolio`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json())
+      .then(items => {
+        if (!Array.isArray(items)) return;
+        setOwned({
+          catalogIds: new Set(items.map(i => i.catalog_id)),
+          scpIds:     new Set(items.map(i => i.ebay_item_id).filter(Boolean)),
+        });
+      })
+      .catch(() => {});
+  }, [token]);
+
+  function isOwned(item) {
+    return item.source === 'local'
+      ? owned.catalogIds.has(item.id)
+      : owned.scpIds.has(item.ebay_item_id);
+  }
 
   // Sorted view of the results — local (already-saved) entries stay pinned on
   // top; SCP results sort by reference price.
@@ -497,12 +524,13 @@ export default function Add() {
                   const key = item.source === 'scp' ? item.ebay_item_id : String(item.id);
                   const isRegistering = registeringId === item.ebay_item_id;
                   const price = fmt(item.current_value);
+                  const alreadyOwned = isOwned(item);
 
                   return (
                     <button
                       key={key}
-                      onClick={() => openForm(item)}
-                      disabled={!!registeringId}
+                      onClick={() => !alreadyOwned && openForm(item)}
+                      disabled={!!registeringId || alreadyOwned}
                       className="w-full text-left bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700
                                  rounded-xl p-4 transition group disabled:opacity-60 disabled:cursor-default"
                     >
@@ -543,6 +571,11 @@ export default function Add() {
                               {price}
                               {item.source === 'scp' && <span className="text-zinc-500 font-normal"> · via SportsCardsPro</span>}
                             </p>
+                          )}
+                          {alreadyOwned && (
+                            <span className="inline-block mt-1 text-[10px] px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700">
+                              ✓ Already in collection
+                            </span>
                           )}
                           {item.sport_game && (
                             <p className="text-zinc-600 text-[11px] mt-0.5 capitalize">{item.sport_game}</p>

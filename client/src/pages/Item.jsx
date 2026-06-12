@@ -46,7 +46,8 @@ const GRADE_OPTIONS = {
   SGC:  ['10', '9.5', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
   CGC:  CGC_SCALE,
   CBCS: CGC_SCALE,
-  PGX:  ['10', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.5', '1.0'],
+  PGX:  CGC_SCALE,
+  TAG:  ['10', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
 };
 const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
 
@@ -70,12 +71,30 @@ const GRADE_COLORS = {
   'PSA 10':    '#f59e0b',
 };
 
-// Canonical row order for the grade price table
+// Canonical row order for the grade price table — works for "Grade 8.5",
+// "PSA 10", and comic-format labels like "CGC 9.8" alike.
 function gradeOrderKey(label) {
   if (label === 'Ungraded') return -1;
-  if (label === 'PSA 10')   return 99;
-  const n = parseFloat(String(label).replace('Grade ', ''));
+  const n = parseFloat(String(label).replace(/^[^0-9.]*/, ''));
   return isNaN(n) ? 50 : n;
+}
+
+// Line/dot color for any grade label — exact tier names first, then by the
+// numeric grade (covers comic-format labels like "CGC 9.8").
+function colorFor(label) {
+  if (GRADE_COLORS[label]) return GRADE_COLORS[label];
+  const n = parseFloat(String(label).replace(/^[^0-9.]*/, ''));
+  if (isNaN(n))  return '#10b981';
+  if (n >= 10)   return '#f59e0b';
+  if (n >= 9.5)  return '#8b5cf6';
+  if (n >= 9)    return '#6366f1';
+  if (n >= 8)    return '#14b8a6';
+  if (n >= 7)    return '#0ea5e9';
+  if (n >= 6)    return '#4ade80';
+  if (n >= 5)    return '#a3e635';
+  if (n >= 4)    return '#fbbf24';
+  if (n >= 3)    return '#fb923c';
+  return '#f87171';
 }
 
 function truncateTitle(t, max = 60) {
@@ -602,8 +621,13 @@ export default function Item() {
                     // hide the broken image; pricing replaces it with a
                     // verified URL on the next refresh.
                     onError={e => { e.currentTarget.style.display = 'none'; }}
-                    // White-background product shots blend into a light tile
-                    onLoad={e => blendIfLightBackground(e.currentTarget)}
+                    // White-background SLAB shots blend into a light tile —
+                    // sealed boxes, raw cards, and comic covers render as-is
+                    onLoad={e => {
+                      if (item.condition === 'graded' && item.grading_company) {
+                        blendIfLightBackground(e.currentTarget);
+                      }
+                    }}
                   />
                 : <ItemIcon type={item.item_type} />
               }
@@ -857,10 +881,10 @@ export default function Item() {
                             key={label}
                             type="monotone"
                             dataKey={label}
-                            stroke={GRADE_COLORS[label] ?? '#10b981'}
+                            stroke={colorFor(label)}
                             strokeWidth={isUser || isSolo ? 2.5 : 1.2}
                             strokeOpacity={isUser || isSolo ? 1 : 0.55}
-                            dot={chartRows.length === 1 ? { r: 4, strokeWidth: 0, fill: GRADE_COLORS[label] ?? '#10b981' } : false}
+                            dot={chartRows.length === 1 ? { r: 4, strokeWidth: 0, fill: colorFor(label) } : false}
                             activeDot={{ r: 4 }}
                             connectNulls
                           />
@@ -881,7 +905,7 @@ export default function Item() {
                               : 'border-zinc-800 text-zinc-500'
                           }`}
                         >
-                          <span className="w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[label] ?? '#10b981' }} />
+                          <span className="w-2 h-2 rounded-full mr-1.5" style={{ background: colorFor(label) }} />
                           {label}
                         </span>
                       ))}
@@ -908,7 +932,7 @@ export default function Item() {
                             .map(g => (
                               <tr key={g.grade} className={g.is_user_grade ? 'text-white font-semibold' : 'text-zinc-400'}>
                                 <td className="py-1">
-                                  <span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: GRADE_COLORS[g.grade] ?? '#10b981' }} />
+                                  <span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: colorFor(g.grade) }} />
                                   {g.grade}
                                 </td>
                                 <td className="text-right py-1">{fmt$(g.current)}</td>
@@ -1063,7 +1087,7 @@ export default function Item() {
                 </p>
                 {/* Subgrade pills — half-grade scales (BGS/SGC/CGC) can jump
                     straight to any subgrade that has sales data */}
-                {['BGS', 'BECKETT', 'SGC', 'CGC'].includes((item.grading_company ?? '').toUpperCase()) &&
+                {['BGS', 'BECKETT', 'SGC', 'CGC', 'CBCS', 'PGX'].includes((item.grading_company ?? '').toUpperCase()) &&
                   Object.keys(market?.sales_by_grade ?? {}).length > 1 && (
                   <div className="flex flex-wrap gap-1.5 mb-3">
                     {Object.keys(market.sales_by_grade)
@@ -1321,7 +1345,7 @@ export default function Item() {
                     className={INPUT}
                   >
                     <option value="">—</option>
-                    {['PSA','BGS','SGC','CGC','CBCS','PGX'].map(g => <option key={g} value={g}>{g}</option>)}
+                    {['PSA','BGS','SGC','CGC','CBCS','PGX','TAG'].map(g => <option key={g} value={g}>{g}</option>)}
                   </select>
                 </div>
                 <div>

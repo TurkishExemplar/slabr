@@ -633,7 +633,13 @@ function ItemCard({ item }) {
               src={item.image_url}
               alt={item.name}
               loading="lazy"
-              onLoad={e => { setImgLoaded(true); blendIfLightBackground(e.currentTarget); }}
+              onLoad={e => {
+                setImgLoaded(true);
+                // Blend only graded slab shots — boxes/raw/comics render as-is
+                if (item.condition === 'graded' && item.grading_company) {
+                  blendIfLightBackground(e.currentTarget);
+                }
+              }}
               // Unverified CDN guesses can 404 — hide the image and stop the
               // loading pulse, leaving the plain zinc tile
               onError={e => { e.currentTarget.style.display = 'none'; setImgLoaded(true); }}
