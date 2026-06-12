@@ -96,12 +96,28 @@ async function ebayGet(path, params = {}) {
   return res.json();
 }
 
+// ── HTML entity decoding ──────────────────────────────────────────────────────
+// Card names arrive from scrapes and APIs with baked-in entities
+// ("Dunk &#39;N Go-Nuts") that corrupt every downstream search query.
+function decodeHtmlEntities(s) {
+  return String(s ?? '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
 // ── Query builder ─────────────────────────────────────────────────────────────
 
 function buildQuery(item) {
   if (item.ebay_search_query) return item.ebay_search_query;
 
-  const { item_type, name, year, set_name, sport_game, card_number, brand_publisher, condition, grading_company, grade, rarity } = item;
+  const { item_type, name: _rawName, year, set_name: _rawSet, sport_game, card_number, brand_publisher, condition, grading_company, grade, rarity } = item;
+  const name     = decodeHtmlEntities(_rawName);
+  const set_name = _rawSet == null ? _rawSet : decodeHtmlEntities(_rawSet);
   const gradeStr   = condition === 'graded' && grade ? `${grading_company ?? 'PSA'} ${grade}` : '';
   // Append "Rookie" when the card is explicitly tagged as a rookie — helps
   // eBay ranking favour the RC version over cheaper parallels or reprint sets.
@@ -759,7 +775,7 @@ function parsePcPage(html) {
       gradeLabel,
       date:       rm[2],
       url:        rm[3] ?? null,
-      title:      (rm[4] ?? '').trim() || null,
+      title:      decodeHtmlEntities((rm[4] ?? '').trim()) || null,
       price:      parseFloat(rm[5].replace(/,/g, '')),
     });
   }
@@ -817,7 +833,10 @@ function escapeRegExp(s) {
 // grading and rookie markers) so the queries are built from a clean core
 // name like "Michael Jordan".
 function cleanPcName(item) {
-  const { name, set_name } = item;
+  // Decode entities, then drop apostrophes — they break PC's literal search
+  // ("Dunk 'N Go-Nuts" → "Dunk N Go-Nuts")
+  const name     = decodeHtmlEntities(item.name).replace(/['’]/g, '');
+  const set_name = item.set_name == null ? item.set_name : decodeHtmlEntities(item.set_name);
   let n = ` ${name ?? ''} `;
   if (set_name) n = n.replace(new RegExp(escapeRegExp(set_name.trim()), 'ig'), ' ');
   n = n
@@ -833,7 +852,9 @@ function cleanPcName(item) {
 
 // Build the deduplicated query-variation ladder for an item (most → least specific).
 function buildPcQueries(item) {
-  const { name, year, set_name, card_number } = item;
+  const { year, card_number } = item;
+  const name     = decodeHtmlEntities(item.name).replace(/['’]/g, '');
+  const set_name = item.set_name == null ? item.set_name : decodeHtmlEntities(item.set_name);
   const coreName = cleanPcName(item);
 
   // Brand token from set_name with any leading year/season stripped —
@@ -1590,15 +1611,23 @@ function scpParseConsole(consoleName) {
   return { year, sport, set_name: set || null };
 }
 
-// Normalize a user query for SCP's literal search: lowercase, strip special
-// characters, collapse whitespace.
+// Normalize a user query for SCP's literal search: decode HTML entities,
+// lowercase, expand common abbreviations, strip special characters
+// (apostrophes break their API — "Dunk 'N Go-Nuts" → "dunk n go-nuts"),
+// collapse whitespace.
 function normalizeScpQuery(q) {
-  return String(q ?? '')
+  return decodeHtmlEntities(String(q ?? ''))
     .toLowerCase()
+    .replace(/\brc\b/g, 'rookie')
+    .replace(/\bsp\b/g, 'short print')
     .replace(/[^a-z0-9#/.\s-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+// 5-minute result cache — repeated searches for the same term are instant
+const _scpSearchCache = new Map();
+const SCP_SEARCH_TTL_MS = 5 * 60 * 1000;
 
 // Returns results mapped to the catalog shape the /add page expects.
 // The SCP product id is stored in ebay_item_id (reused column) so future
@@ -1617,6 +1646,11 @@ async function scpSearch(query, limit = 8, opts = {}) {
 
   const norm  = normalizeScpQuery(query);
   if (!norm) return [];
+
+  const cacheKey = `${norm}|${opts.category ?? ''}|${opts.sport ?? ''}|${opts.condition ?? ''}|${limit}`;
+  const hit = _scpSearchCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < SCP_SEARCH_TTL_MS) return hit.results;
+
   const words = norm.split(' ');
   const attempts = [...new Set([
     opts.sport && !norm.includes(opts.sport) ? `${norm} ${opts.sport}` : null,
@@ -1624,6 +1658,15 @@ async function scpSearch(query, limit = 8, opts = {}) {
     words.length >= 3 ? words.slice(0, 2).join(' ') : null,
     words.length >= 2 ? words[0] : null,
   ].filter(Boolean))];
+
+  // Results accumulate across attempts (deduped by product id) until at
+  // least 3 are found — a too-specific first query no longer ends the search.
+  const collected = new Map();
+  const finish = () => {
+    const results = [...collected.values()].slice(0, limit);
+    _scpSearchCache.set(cacheKey, { at: Date.now(), results });
+    return results;
+  };
 
   for (const baseUrl of PC_BASES) {
     for (const attempt of attempts) {
@@ -1657,7 +1700,7 @@ async function scpSearch(query, limit = 8, opts = {}) {
         }
 
         const consoleName = product['console-name'] ?? p['console-name'] ?? '';
-        const productName = product['product-name'] ?? p['product-name'] ?? '';
+        const productName = decodeHtmlEntities(product['product-name'] ?? p['product-name'] ?? '');
         const { year, sport, set_name } = scpParseConsole(consoleName);
 
         // Card number from the product name ("Michael Jordan #57" → "57") —
@@ -1709,15 +1752,18 @@ async function scpSearch(query, limit = 8, opts = {}) {
       if (!results.length) continue; // filters emptied this attempt — broaden
 
       console.log(`[scp-search] "${attempt}" → ${results.length} result(s) via ${new URL(baseUrl).hostname}`);
-      results.forEach(e => console.log(`[scp-search]   "${e.name}" image: ${e.image_url ?? 'none'}`));
-      return results;
+      for (const r of results) {
+        if (!collected.has(r.ebay_item_id)) collected.set(r.ebay_item_id, r);
+      }
+      if (collected.size >= 3) return finish();
     } catch (err) {
       console.error(`[scp-search] ${baseUrl} "${attempt}" error: ${err.message}`);
     }
     }
+    if (collected.size) return finish(); // some results on this base — done
   }
 
-  return [];
+  return finish();
 }
 
 module.exports = {
@@ -1725,6 +1771,6 @@ module.exports = {
   buildQuery, fetchPriceCharting, scorePcProduct, buildPcQueries, pcPriceForGrade,
   extractPcHistoryPoints, fetchPcPriceHistory, parsePcPage, fetchPcPage,
   backfillPcHistory, upsertPcSales, titleMatchesCompany,
-  getItemComps, pcTierLabelFor,
+  getItemComps, pcTierLabelFor, decodeHtmlEntities,
   PC_BASES, PC_JUNK_CONSOLE_RE, PC_TIERS,
 };

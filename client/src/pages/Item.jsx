@@ -218,6 +218,29 @@ export default function Item() {
     // item?.id (not item) — re-running on every item edit would refetch eBay needlessly
   }, [item?.id, id, token]);
 
+  // Newly added cards have no image until the background pricer saves the
+  // PriceCharting shot — poll briefly so it appears without a manual refresh.
+  // (Scan photos are never used as card images.)
+  useEffect(() => {
+    if (!item || item.image_url) return;
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      if (tries > 8) { clearInterval(timer); return; }
+      try {
+        const r = await fetch(`${API}/api/portfolio/${id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const d = await r.json();
+        if (d.image_url) {
+          setItem(prev => ({ ...prev, image_url: d.image_url }));
+          clearInterval(timer);
+        }
+      } catch { /* keep polling */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [item?.id, item?.image_url, id, token]);
+
   // Fetch the multi-grade market view (chart series, grade prices, sales)
   useEffect(() => {
     if (!item) return;
@@ -629,7 +652,13 @@ export default function Item() {
                       }
                     }}
                   />
-                : <ItemIcon type={item.item_type} />
+                : (
+                  // Image pending: the pricer fetches the PriceCharting shot
+                  // shortly after add — pulse while we poll for it
+                  <div className="w-full h-full flex items-center justify-center animate-pulse">
+                    <ItemIcon type={item.item_type} />
+                  </div>
+                )
               }
             </div>
 
@@ -1085,9 +1114,8 @@ export default function Item() {
                           ? ` · ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
                           : ` · ${market.user_tier}`)}
                 </p>
-                {/* Subgrade pills — half-grade scales (BGS/SGC/CGC) can jump
-                    straight to any subgrade that has sales data */}
-                {['BGS', 'BECKETT', 'SGC', 'CGC', 'CBCS', 'PGX'].includes((item.grading_company ?? '').toUpperCase()) &&
+                {/* Grade pills — jump straight to any grade that has sales data */}
+                {item.grading_company &&
                   Object.keys(market?.sales_by_grade ?? {}).length > 1 && (
                   <div className="flex flex-wrap gap-1.5 mb-3">
                     {Object.keys(market.sales_by_grade)

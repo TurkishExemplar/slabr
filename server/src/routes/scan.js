@@ -28,7 +28,12 @@ function itemTypeFromHint(hint) {
 //   3. full name only            — only safe when name includes set info
 //   4. auto-create               — nothing matched
 async function resolveCatalogId(fields) {
-  const { item_type, name, set_name, card_number, year, sport_game, rarity } = fields;
+  const { decodeHtmlEntities } = require('../jobs/ebay');
+  const { item_type, card_number, year, sport_game, rarity } = fields;
+  // Decode entities so "&#39;" never lands in catalog names (it corrupts
+  // every downstream search query)
+  const name     = decodeHtmlEntities(fields.name);
+  const set_name = fields.set_name == null ? fields.set_name : decodeHtmlEntities(fields.set_name);
   if (!name) return null;
 
   let id = null;

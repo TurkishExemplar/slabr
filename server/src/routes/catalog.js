@@ -36,6 +36,18 @@ router.get('/search', async (req, res) => {
     LIMIT 10
   `, wordParams);
 
+  // Progressive search: ?local_only=1 returns just the (fast) catalog
+  // matches so the client can paint them while SCP results stream in.
+  if (req.query.local_only === '1') {
+    try {
+      const { rows } = await localQuery;
+      return res.json(rows.map(r => ({ ...r, source: 'local' })));
+    } catch (err) {
+      console.error('[catalog search local]', err.message);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  }
+
   const hasScp = !!(process.env.PRICE_CHARTING_TOKEN ?? '').trim();
 
   try {
@@ -81,7 +93,11 @@ router.get('/search', async (req, res) => {
 // '/from-ebay' is kept as an alias for clients deployed before the rename.
 
 async function handleFromScp(req, res) {
-  const { ebay_item_id, name, item_type, year, set_name, card_number, sport_game, image_url } = req.body ?? {};
+  const { decodeHtmlEntities } = require('../jobs/ebay');
+  const { ebay_item_id, item_type, year, card_number, sport_game, image_url } = req.body ?? {};
+  // Entities corrupt search queries — never let them into catalog names
+  const name     = req.body?.name ? decodeHtmlEntities(req.body.name) : req.body?.name;
+  const set_name = req.body?.set_name ? decodeHtmlEntities(req.body.set_name) : req.body?.set_name;
 
   if (!ebay_item_id || !name) {
     return res.status(400).json({ error: 'ebay_item_id and name are required' });

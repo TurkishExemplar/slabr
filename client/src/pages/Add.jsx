@@ -101,6 +101,32 @@ export default function Add() {
   // What's already in the user's portfolio — search results that match get
   // an "Already in collection" badge and a disabled add button.
   const [owned, setOwned] = useState({ catalogIds: new Set(), scpIds: new Set() });
+
+  // Duplicate prompt: same catalog+condition+grade already owned —
+  // { body, existingQty } while the user decides add-anyway vs increment
+  const [duplicatePrompt, setDuplicatePrompt]     = useState(null);
+  const [duplicateWorking, setDuplicateWorking]   = useState(false);
+
+  async function resolveDuplicate(mode) {
+    if (!duplicatePrompt) return;
+    setDuplicateWorking(true);
+    try {
+      const res = await fetch(`${API}/api/portfolio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ...duplicatePrompt.body, on_duplicate: mode }),
+      });
+      if (res.ok) {
+        navigate('/dashboard', { state: { added: true } });
+      } else {
+        setDuplicatePrompt(null);
+      }
+    } catch {
+      setDuplicatePrompt(null);
+    } finally {
+      setDuplicateWorking(false);
+    }
+  }
   const [registeringId, setRegisteringId] = useState(null); // ebay_item_id being registered
   const [selectedItem, setSelectedItem]   = useState(null);
   const [panelOpen, setPanelOpen]         = useState(false);
@@ -216,6 +242,10 @@ export default function Add() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
       });
+      if (res.status === 409) {
+        const d = await res.json();
+        if (d.duplicate) { setDuplicatePrompt({ body, existingQty: d.existing_quantity }); return; }
+      }
       if (!res.ok) { const d = await res.json(); setScanSubmitError(d.error || 'Failed to add item'); return; }
       navigate('/dashboard', { state: { added: true } });
     } catch {
@@ -238,7 +268,19 @@ export default function Add() {
     if (!q) { setResults([]); setSuggestion(null); setManualMode(false); return; }
     setSearching(true);
     const ctrl = new AbortController();
+    let fullArrived = false;
     const t = setTimeout(async () => {
+      // Progressive: paint the (fast) local catalog matches immediately
+      // while the SportsCardsPro search is still in flight.
+      fetch(`${API}/api/catalog/search?${new URLSearchParams({ q, local_only: '1' })}`, { signal: ctrl.signal })
+        .then(r => r.json())
+        .then(data => {
+          if (!fullArrived && !ctrl.signal.aborted && Array.isArray(data) && data.length) {
+            setResults(data);
+          }
+        })
+        .catch(() => {});
+
       try {
         const params = new URLSearchParams({ q });
         if (searchCategory !== 'all') params.set('category', searchCategory);
@@ -246,6 +288,7 @@ export default function Add() {
         if (searchCondition !== 'all') params.set('condition', searchCondition);
         const res = await fetch(`${API}/api/catalog/search?${params}`, { signal: ctrl.signal });
         const data = await res.json();
+        fullArrived = true;
         // Plain array on hits; { results, suggestion } when empty
         setResults(Array.isArray(data) ? data : (data.results ?? []));
         setSuggestion(Array.isArray(data) ? null : (data.suggestion ?? null));
@@ -254,7 +297,7 @@ export default function Add() {
       } finally {
         if (!ctrl.signal.aborted) setSearching(false);
       }
-    }, 350);
+    }, 200);
     return () => { clearTimeout(t); ctrl.abort(); };
   }, [query, searchCategory, searchSport, searchCondition]);
 
@@ -403,6 +446,10 @@ export default function Add() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
       });
+      if (res.status === 409) {
+        const d = await res.json();
+        if (d.duplicate) { setDuplicatePrompt({ body, existingQty: d.existing_quantity }); return; }
+      }
       if (!res.ok) { const d = await res.json(); setFormError(d.error || 'Failed to add item'); return; }
       navigate('/dashboard', { state: { added: true } });
     } catch {
@@ -1176,6 +1223,43 @@ export default function Add() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Duplicate-card prompt */}
+      {duplicatePrompt && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-2xl p-6 max-w-sm w-full">
+            <p className="text-white font-semibold mb-1">Already in your collection</p>
+            <p className="text-zinc-400 text-sm mb-5">
+              This card (same grade and grading company) is already in your portfolio
+              {duplicatePrompt.existingQty != null ? ` with quantity ${duplicatePrompt.existingQty}` : ''}.
+              Add it again, or update the quantity on the existing entry?
+            </p>
+            <div className="space-y-2">
+              <button
+                onClick={() => resolveDuplicate('increment')}
+                disabled={duplicateWorking}
+                className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition disabled:opacity-50"
+              >
+                {duplicateWorking ? 'Working…' : 'Update quantity'}
+              </button>
+              <button
+                onClick={() => resolveDuplicate('add')}
+                disabled={duplicateWorking}
+                className="w-full py-2.5 rounded-xl border border-zinc-700 text-zinc-300 hover:border-zinc-500 text-sm transition disabled:opacity-50"
+              >
+                Add as a separate entry
+              </button>
+              <button
+                onClick={() => setDuplicatePrompt(null)}
+                disabled={duplicateWorking}
+                className="w-full py-2 text-zinc-500 hover:text-zinc-300 text-xs transition"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}

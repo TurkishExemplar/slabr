@@ -152,6 +152,20 @@ CREATE TABLE IF NOT EXISTS pc_sales (
 CREATE INDEX IF NOT EXISTS pc_sales_catalog_grade_idx
   ON pc_sales (catalog_id, grade_label, sold_date DESC);
 
+-- Phase 16: decode HTML entities baked into names/titles by earlier imports
+-- ("Dunk &#39;N Go-Nuts") — they corrupt search queries and display.
+-- Safe to run repeatedly: only touches rows that still contain entities.
+-- Must run AFTER the pc_sales CREATE above (fresh databases).
+UPDATE master_catalog
+SET name = replace(replace(replace(replace(name, '&#39;', ''''), '&#x27;', ''''), '&quot;', '"'), '&amp;', '&')
+WHERE name LIKE '%&#39;%' OR name LIKE '%&#x27;%' OR name LIKE '%&quot;%' OR name LIKE '%&amp;%';
+UPDATE master_catalog
+SET set_name = replace(replace(replace(replace(set_name, '&#39;', ''''), '&#x27;', ''''), '&quot;', '"'), '&amp;', '&')
+WHERE set_name LIKE '%&#39;%' OR set_name LIKE '%&#x27;%' OR set_name LIKE '%&quot;%' OR set_name LIKE '%&amp;%';
+UPDATE pc_sales
+SET title = replace(replace(replace(replace(title, '&#39;', ''''), '&#x27;', ''''), '&quot;', '"'), '&amp;', '&')
+WHERE title LIKE '%&#39;%' OR title LIKE '%&#x27;%' OR title LIKE '%&quot;%' OR title LIKE '%&amp;%';
+
 -- Clear bad CDN image_url values so priceSingleItem / refresh-image can re-fetch.
 -- NOTE: data: URIs are intentionally preserved — they are scan photos uploaded
 -- by the user and should remain until eBay's priceSingleItem replaces them with

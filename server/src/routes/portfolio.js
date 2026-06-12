@@ -128,6 +128,38 @@ router.post('/', async (req, res) => {
   }
 
   try {
+    // ── Duplicate guard ───────────────────────────────────────────────────
+    // Same catalog + condition + grade + company already in this portfolio?
+    // body.on_duplicate: 'add' forces a second entry, 'increment' bumps the
+    // existing quantity; otherwise 409 so the client can ask the user.
+    const onDuplicate = req.body?.on_duplicate;
+    if (onDuplicate !== 'add') {
+      const { rows: dupes } = await pool.query(`
+        SELECT id, quantity FROM portfolio_items
+        WHERE user_id = $1 AND catalog_id = $2
+          AND condition       IS NOT DISTINCT FROM $3
+          AND grade           IS NOT DISTINCT FROM $4
+          AND grading_company IS NOT DISTINCT FROM $5
+        LIMIT 1
+      `, [req.user.userId, catalog_id, condition ?? null, grade ?? null, grading_company ?? null]);
+
+      if (dupes.length) {
+        if (onDuplicate === 'increment') {
+          const { rows: updated } = await pool.query(
+            'UPDATE portfolio_items SET quantity = quantity + $1 WHERE id = $2 RETURNING *',
+            [quantity ?? 1, dupes[0].id]
+          );
+          return res.json({ ...updated[0], duplicate_incremented: true });
+        }
+        return res.status(409).json({
+          duplicate: true,
+          existing_item_id: dupes[0].id,
+          existing_quantity: dupes[0].quantity,
+          error: 'This card is already in your collection',
+        });
+      }
+    }
+
     let current_value;
 
     if (scan_identified && scan_value != null) {
@@ -283,19 +315,21 @@ router.get('/:id/market', async (req, res) => {
       return n >= 10 ? 'PSA 10' : `Grade ${n}`;
     };
 
-    // Comic-scale companies (CGC/CBCS/PGX) display everything in the
-    // company's own grade format — "CGC 8.5", never "Grade 8" buckets and
-    // never "PSA 10" on a comic.
-    const comicScale = item.condition === 'graded'
-      && ['CGC', 'CBCS', 'PGX'].includes((item.grading_company ?? '').toUpperCase());
+    // Every graded item displays in its company's own grade format —
+    // "BGS 9.5" / "PSA 9" / "CGC 8.5", never bare "Grade X" buckets (and
+    // never "PSA 10" on a non-PSA item).  Comic-scale companies keep their
+    // decimal formatting (CGC 8.0); sports companies trim trailing zeros.
+    const companyScale = item.condition === 'graded' && !!item.grading_company;
     const coName = item.grading_company;
+    const comicFormat = ['CGC', 'CBCS', 'PGX'].includes((coName ?? '').toUpperCase());
+    const fmtGrade = n => comicFormat ? parseFloat(n).toFixed(1) : String(parseFloat(n));
     const displayLabel = (label) => {
-      if (!comicScale || label === 'Ungraded') return label;
-      if (label === 'PSA 10') return `${coName} 10`;
+      if (!companyScale || label === 'Ungraded') return label;
+      if (label === 'PSA 10') return `${coName} ${fmtGrade(10)}`;
       const m = String(label).match(/^Grade (\d+(?:\.\d+)?)$/);
-      return m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : label;
+      return m ? `${coName} ${fmtGrade(m[1])}` : label;
     };
-    const gradeExtractRe = comicScale
+    const gradeExtractRe = companyScale
       ? new RegExp(`${coName}\\s*-?\\s*(\\d{1,2}(?:\\.\\d)?)\\b`, 'i')
       : null;
 
@@ -329,7 +363,7 @@ router.get('/:id/market', async (req, res) => {
     // Skipped for comic-scale items: their sales are re-keyed by the EXACT
     // grade in each title below, and bucket-level series would double-count
     // the same sales under relabeled bucket names.
-    if (!comicScale) {
+    if (!companyScale) {
       const tierSeriesLabels = new Set(Object.keys(historyByGrade));
       const { rows: derived } = await pool.query(`
         SELECT grade_label,
@@ -390,12 +424,12 @@ router.get('/:id/market', async (req, res) => {
     // Comic-scale transform: re-key every sale by the EXACT grade in its
     // title ("CGC 9.8"), relabel the tier series to the company format, and
     // drop the sports-centric bucket labels entirely.
-    if (comicScale) {
+    if (companyScale) {
       const regrouped = {};
       for (const [label, list] of Object.entries(salesByGrade)) {
         for (const s of list) {
           const m = (s.title ?? '').match(gradeExtractRe);
-          const key = m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : displayLabel(label);
+          const key = m ? `${coName} ${fmtGrade(m[1])}` : displayLabel(label);
           (regrouped[key] ??= []).push({ ...s, grade_label: key });
         }
       }
@@ -469,10 +503,10 @@ router.get('/:id/market', async (req, res) => {
     // Recent Sales badges show the EXACT grade from each title for
     // comic-scale companies — never a bucket grade.
     let compsSales = comps.sales;
-    if (comicScale) {
+    if (companyScale) {
       compsSales = comps.sales.map(s => {
         const m = (s.title ?? '').match(gradeExtractRe);
-        return { ...s, grade_label: m ? `${coName} ${parseFloat(m[1]).toFixed(1)}` : displayLabel(s.grade_label) };
+        return { ...s, grade_label: m ? `${coName} ${fmtGrade(m[1])}` : displayLabel(s.grade_label) };
       });
     }
 
@@ -488,7 +522,7 @@ router.get('/:id/market', async (req, res) => {
 
     // For comic-scale items the selection default is the user's exact grade
     // series when it has data, since bucket labels no longer exist as keys.
-    const bucketDisplay = comicScale
+    const bucketDisplay = companyScale
       ? (salesByGrade[userSeries] || historyByGrade[userSeries] ? userSeries : displayLabel(userLabel))
       : userLabel;
 
