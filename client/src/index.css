@@ -2,6 +2,13 @@
 @tailwind components;
 @tailwind utilities;
 
+/* White-background product shots (sealed boxes, slabs photographed on white):
+   multiply needs a light surface behind it, so detection also sets a light
+   tile on the container — the white photo background then melts into it. */
+.img-white-bg {
+  mix-blend-mode: multiply;
+}
+
 @layer base {
   * {
     box-sizing: border-box;

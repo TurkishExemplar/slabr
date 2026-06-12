@@ -80,6 +80,7 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'slabr-api' }));
 // rather than a silent uncaughtException from the top-level require().
 try {
   app.use('/api',           require('./routes/health'));
+  app.use('/api/img',       require('./routes/img')); // unauthenticated image proxy (whitelisted CDNs)
   app.use('/api/auth',      require('./routes/auth'));
   app.use('/api/portfolio', authMiddleware, require('./routes/portfolio'));
   app.use('/api/catalog',   require('./routes/catalog'));

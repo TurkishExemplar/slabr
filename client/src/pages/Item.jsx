@@ -37,13 +37,16 @@ const SOURCE_LABEL = {
   none:          'Not yet priced',
 };
 
-// Grade ladders for the edit form (mirrors the add form)
-const GENERIC_GRADES = ['1', '1.5', '2', '2.5', '3', '3.5', '4', '4.5', '5', '5.5', '6', '6.5', '7', '7.5', '8', '8.5', '9', '9.5', '10'];
+// Grade ladders for the edit form (mirrors the add form) — highest first.
+const GENERIC_GRADES = ['10', '9.5', '9', '8.5', '8', '7.5', '7', '6.5', '6', '5.5', '5', '4.5', '4', '3.5', '3', '2.5', '2', '1.5', '1'];
+const CGC_SCALE = ['10', '9.9', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.8', '1.5', '1.0', '0.5'];
 const GRADE_OPTIONS = {
-  PSA: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-  BGS: [...GENERIC_GRADES, '10 Black Label'],
-  SGC: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '9.5', '10'],
-  CGC: ['0.5', ...GENERIC_GRADES],
+  PSA:  ['10', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
+  BGS:  ['10 Black Label', ...GENERIC_GRADES],
+  SGC:  ['10', '9.5', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
+  CGC:  CGC_SCALE,
+  CBCS: CGC_SCALE,
+  PGX:  ['10', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.5', '1.0'],
 };
 const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
 
@@ -221,9 +224,11 @@ export default function Item() {
           : {});
 
     const now = Date.now();
-    const cutoff = range === '6M' ? now - 182  * 86400_000 :
-                   range === '1Y' ? now - 365  * 86400_000 :
-                                    now - 1825 * 86400_000; // 5Y
+    const cutoff = range === '7D'  ? now - 7    * 86400_000 :
+                   range === '30D' ? now - 30   * 86400_000 :
+                   range === '90D' ? now - 90   * 86400_000 :
+                   range === '1Y'  ? now - 365  * 86400_000 :
+                                     now - 1825 * 86400_000; // 5Y
 
     const rowsByDate = new Map();
     const series = [];
@@ -244,6 +249,32 @@ export default function Item() {
     const rows = [...rowsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     return { chartRows: rows, chartSeries: series };
   }, [market, priceHistory, range]);
+
+  // Per-range x-axis label format — and a deduplicated tick list so the same
+  // label never repeats (daily points within one month all format to the
+  // same "Jun 2026" in the 1Y view).
+  const fmtTick = (d) => {
+    const dt = new Date(`${d}T12:00:00`);
+    if (range === '7D')  return dt.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' });  // Mon 26
+    if (range === '30D' || range === '90D') {
+      return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });                       // Jun 26
+    }
+    if (range === '1Y')  return dt.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });   // Jun 2025
+    return String(dt.getFullYear());                                                                   // 2022
+  };
+  const xTicks = useMemo(() => {
+    const seen = new Set();
+    const ticks = [];
+    for (const row of chartRows) {
+      const label = fmtTick(row.date);
+      if (!seen.has(label)) {
+        seen.add(label);
+        ticks.push(row.date);
+      }
+    }
+    return ticks;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartRows, range]);
 
   // Default the dropdown to the user's grade bucket (the most relevant
   // well-populated line); 'All' overlays every grade.
@@ -782,7 +813,7 @@ export default function Item() {
                     </select>
                   )}
                   <div className="flex items-center bg-zinc-800 rounded-lg p-0.5 gap-0.5">
-                    {['6M', '1Y', '5Y'].map(r => (
+                    {['7D', '30D', '90D', '1Y', '5Y'].map(r => (
                       <button
                         key={r}
                         onClick={() => setRange(r)}
@@ -804,7 +835,8 @@ export default function Item() {
                       <XAxis
                         dataKey="date"
                         tick={{ fill: '#71717a', fontSize: 10 }}
-                        tickFormatter={d => { const [y, m] = d.split('-'); return `${m}/${y.slice(2)}`; }}
+                        ticks={xTicks}
+                        tickFormatter={fmtTick}
                       />
                       <YAxis
                         tick={{ fill: '#71717a', fontSize: 10 }}
@@ -1023,11 +1055,11 @@ export default function Item() {
                 <p className="text-zinc-600 text-xs mb-3">
                   {!showingUserSales
                     ? `Last ${shownSales.length} sales · ${resolvedGradeView}`
-                    : `Last ${shownSales.length} sales` + (market.user_bucket !== market.user_tier
-                        ? (market.sales_filtered
-                            ? ` · ${market.user_bucket} bucket, filtered to ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
-                            : ` · ${market.user_bucket} bucket (no exact ${[item.grading_company, item.grade].filter(Boolean).join(' ')} listings)`)
-                        : ` · ${market.user_tier}`)}
+                    : market.comps_note
+                      ? market.comps_note
+                      : `Last ${shownSales.length} sales` + (market.sales_filtered
+                          ? ` · ${[item.grading_company, item.grade].filter(Boolean).join(' ')}`
+                          : ` · ${market.user_tier}`)}
                 </p>
                 {/* Subgrade pills — half-grade scales (BGS/SGC/CGC) can jump
                     straight to any subgrade that has sales data */}
@@ -1289,7 +1321,7 @@ export default function Item() {
                     className={INPUT}
                   >
                     <option value="">—</option>
-                    {['PSA','BGS','CGC','SGC'].map(g => <option key={g} value={g}>{g}</option>)}
+                    {['PSA','BGS','SGC','CGC','CBCS','PGX'].map(g => <option key={g} value={g}>{g}</option>)}
                   </select>
                 </div>
                 <div>

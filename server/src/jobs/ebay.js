@@ -117,28 +117,45 @@ function buildQuery(item) {
     case 'comic':
       return [name, card_number ? `#${card_number}` : '', brand_publisher, gradeStr].filter(Boolean).join(' ');
     case 'sealed': {
-      // Sealed boxes need the exact product + year + box type + "sealed" —
-      // a bare set name surfaces single packs and opened product.
+      // Sealed boxes MUST query: product name + year + box type + "sealed".
+      // Pokemon product additionally carries the "pokemon" token — generic
+      // set names ("Evolving Skies") surface singles without it.
       const txt = `${name} ${set_name ?? ''} ${sport_game ?? ''}`;
-      const boxType = /\b(box|case)\b/i.test(`${name} ${set_name ?? ''}`)
+      const isPokemon = /pokemon/i.test(txt);
+      const isTcg     = isPokemon || /magic|yu-?gi-?oh|lorcana|tcg|digimon|one\s+piece/i.test(txt);
+      const boxType   = /\b(box|case)\b/i.test(`${name} ${set_name ?? ''}`)
         ? null // product name already says which box it is
-        : (/pokemon|magic|yu-?gi-?oh|lorcana|tcg/i.test(txt) ? 'booster box' : 'hobby box');
-      return [name, year, boxType, 'sealed'].filter(Boolean).join(' ');
+        : (isTcg ? 'booster box' : 'hobby box');
+      const pokemonTag = isPokemon && !/pokemon/i.test(name) ? 'pokemon' : null;
+      const q = [pokemonTag, name, year, boxType, 'sealed'].filter(Boolean).join(' ');
+      console.log(`[ebay] sealed query: "${q}"`);
+      return q;
     }
     default:
       return [name, year, set_name].filter(Boolean).join(' ');
   }
 }
 
-// Sealed-box listing junk: single packs, opened/empty boxes, lots.  "pack" is
-// junk only when the title isn't about a box/case (box titles legitimately
-// say "36 packs").
-function isSealedJunkTitle(title) {
+// Sealed-listing hard filters:
+//   REQUIRE at least one sealed marker: sealed / booster box / hobby box / case
+//   REJECT singles, opened/empty boxes, repacks, lots, bundles — unless the
+//   title also says "sealed" (e.g. "lot of 2 sealed booster boxes" is fine)
+//   REQUIRE "pokemon" in the title when the item is Pokemon product
+const SEALED_REQUIRE_RE = /\bsealed\b|\bbooster\s+box(es)?\b|\bhobby\s+box(es)?\b|\bcase\b/i;
+const SEALED_REJECT_RE  = /\b(singles?|pack\s+only|opened|empty|repack(s|ed)?|lots?|bundles?)\b/i;
+
+function sealedTitleOk(title, item) {
   const t = title ?? '';
-  if (/\b(single|opened|empty|lot|partial|repack)\b/i.test(t)) return true;
-  if (/\bpacks?\b/i.test(t) && !/\b(box|case)\b/i.test(t)) return true;
-  return false;
+  if (!SEALED_REQUIRE_RE.test(t)) return false;
+  if (SEALED_REJECT_RE.test(t) && !/\bsealed\b/i.test(t)) return false;
+  const isPokemon = /pokemon/i.test(`${item?.name ?? ''} ${item?.set_name ?? ''} ${item?.sport_game ?? ''}`);
+  if (isPokemon && !/pokemon/i.test(t)) return false;
+  return true;
 }
+
+// eBay category 183456 = Sealed Trading Card Packs & Sets — scopes sealed
+// searches away from singles categories entirely.
+const EBAY_SEALED_CATEGORY = '183456';
 
 // ── Grade-aware result filters ────────────────────────────────────────────────
 
@@ -187,8 +204,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // gradeFilter: { company, grade } — keeps only graded-slab listings.
 // itemName: card name (e.g. "Stephen Curry") — used to pick the best image
 //   from the filtered results so we don't accidentally show a pack image.
-async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
-  const data = await ebayGet('/buy/browse/v1/item_summary/search', {
+async function fetchActiveLow(keywords, gradeFilter = null, itemName = null, item = null) {
+  const isSealed = item?.item_type === 'sealed';
+  const params = {
     q:      keywords,
     // 25-deep pool: with sort=price the cheapest results are often raw cards
     // that the graded-title filter rejects — a shallow pool can miss every
@@ -197,9 +215,13 @@ async function fetchActiveLow(keywords, gradeFilter = null, itemName = null) {
     limit:  25,
     sort:   'price',
     filter: 'buyingOptions:{FIXED_PRICE}',
-  });
+  };
+  if (isSealed) params.category_ids = EBAY_SEALED_CATEGORY;
 
-  const raw    = data.itemSummaries ?? [];
+  const data = await ebayGet('/buy/browse/v1/item_summary/search', params);
+
+  const raw    = (data.itemSummaries ?? [])
+    .filter(l => !isSealed || sealedTitleOk(l.title, item));
   // Keep only listings whose title contains the grading company + grade
   // (e.g. "PSA 9") — prevents a $10 raw card from becoming the active-low
   // or providing the wrong image.
@@ -231,21 +253,28 @@ const LISTING_JUNK_RE = /\b(lot|bundle|reseal|resealed|proxy|digital|custom|repr
 // ascending (eBay sort=price), so the first card is the cheapest.
 async function fetchActiveListings(item, limit = 8) {
   const keywords    = buildQuery(item);
+  const isSealed    = item.item_type === 'sealed';
   const gradeFilter = item.condition === 'graded' && item.grading_company
     ? { company: item.grading_company, grade: item.grade, cardNumber: item.card_number }
     : null;
 
-  const data = await ebayGet('/buy/browse/v1/item_summary/search', {
+  const params = {
     q:      keywords,
     limit:  25,          // wide pool — title filtering below cuts it down
     sort:   'price',
     filter: 'buyingOptions:{FIXED_PRICE}',
-  });
+  };
+  if (isSealed) {
+    params.category_ids = EBAY_SEALED_CATEGORY;
+    console.log(`[ebay] sealed listings query: "${keywords}" (category ${EBAY_SEALED_CATEGORY})`);
+  }
+
+  const data = await ebayGet('/buy/browse/v1/item_summary/search', params);
 
   const raw      = data.itemSummaries ?? [];
   const filtered = filterByGradeTag(raw, gradeFilter)
-    .filter(l => item.item_type === 'sealed'
-      ? !isSealedJunkTitle(l.title)
+    .filter(l => isSealed
+      ? sealedTitleOk(l.title, item)
       : !LISTING_JUNK_RE.test(l.title ?? ''))
     .filter(l => parseFloat(l.price?.value) > 0);
 
@@ -373,7 +402,7 @@ async function _runEbayJobInner(hasEbay) {
           // comps Recent Sales displays (shared getItemComps).
           await syncPcHistory(combo.catalog_id, combo.condition, combo.grade, pc);
           const comps = await getItemComps(combo.catalog_id, combo);
-          if (comps.count >= 3 && comps.median > 0) {
+          if (comps.count >= 3 && comps.median > 0 && comps.exact) {
             console.log(`[ebay-job] ${combo.name} | sold median from ${comps.count} comps: $${comps.median}`);
             soldMedian = comps.median;
           }
@@ -384,7 +413,7 @@ async function _runEbayJobInner(hasEbay) {
 
       // Active low is always sourced from eBay active listings
       if (hasEbay) {
-        ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name));
+        ({ activeLow } = await fetchActiveLow(keywords, gradeFilter, combo.name, combo));
         console.log(`[ebay-job] ${combo.name} | active low: ${activeLow ? '$' + activeLow : '—'}`);
         await sleep(400);
       }
@@ -1109,14 +1138,23 @@ function pcTierLabelFor(item) {
 // most recent.  median is computed over precisely the sales that render.
 async function getItemComps(catalogId, item) {
   const { label: bucket, halfGrade } = pcTierLabelFor(item);
+  const g = parseFloat(item.grade);
+
+  // Half/decimal grades reference BOTH neighbouring buckets so the fallback
+  // can show "CGC 8.0 and CGC 9.0 for reference" instead of only the floor.
+  let buckets = [bucket];
+  if (halfGrade && !isNaN(g)) {
+    const f = Math.floor(g);
+    buckets = [bucket, f >= 9 ? 'Grade 9.5' : `Grade ${f + 1}`];
+  }
 
   const { rows } = await pool.query(`
     SELECT sold_date::text AS date, grade_label, price, title, url
     FROM pc_sales
-    WHERE catalog_id = $1 AND grade_label = $2
+    WHERE catalog_id = $1 AND grade_label = ANY($2)
     ORDER BY sold_date DESC
-    LIMIT 60
-  `, [catalogId, bucket]);
+    LIMIT 90
+  `, [catalogId, buckets]);
 
   let sales = rows;
   if (item.condition !== 'graded') {
@@ -1126,12 +1164,23 @@ async function getItemComps(catalogId, item) {
   }
 
   let filtered = false;
+  let referenceGrades = [];
   if (halfGrade && item.grading_company) {
     const re = new RegExp(`${item.grading_company}\\s*-?\\s*${escapeRegExp(String(item.grade))}(?![0-9])`, 'i');
     const exact = sales.filter(s => re.test(s.title ?? ''));
     if (exact.length) {
       sales = exact;
       filtered = true;
+    } else {
+      // No exact-grade sales — report which grades the reference set carries
+      // ("No CGC 8.5 sales found — showing CGC 8.0 and CGC 9.0").
+      const gradeRe = new RegExp(`${item.grading_company}\\s*-?\\s*(\\d{1,2}(?:\\.\\d)?)\\b`, 'i');
+      const found = new Set();
+      for (const s of sales) {
+        const m = (s.title ?? '').match(gradeRe);
+        if (m) found.add(m[1]);
+      }
+      referenceGrades = [...found].sort((a, b) => parseFloat(a) - parseFloat(b));
     }
   }
 
@@ -1139,7 +1188,11 @@ async function getItemComps(catalogId, item) {
   const prices = sales.map(s => s.price).filter(p => p > 0).sort((a, b) => a - b);
   const median = prices.length ? prices[Math.floor(prices.length / 2)] : null;
 
-  return { bucket, halfGrade, sales, filtered, median, count: prices.length };
+  // exact=true when the sales are genuinely the item's own grade — only then
+  // may the median drive the sold-median price (a mixed 8/9 reference set is
+  // display-only context, never a valuation).
+  const exact = !halfGrade || filtered;
+  return { bucket, halfGrade, sales, filtered, exact, median, count: prices.length, referenceGrades };
 }
 
 async function fetchPriceCharting(item) {
@@ -1423,7 +1476,7 @@ async function priceSingleItem(catalogId, condition, grade) {
       // two can never disagree.  Tier value remains the fallback for thin
       // markets (< 3 comps).
       const comps = await getItemComps(catalogId, catalogRow);
-      if (comps.count >= 3 && comps.median > 0) {
+      if (comps.count >= 3 && comps.median > 0 && comps.exact) {
         console.log(`[pricing] sold median from ${comps.count} displayed comps: $${comps.median} (tier said $${pc.price})`);
         soldMedian = comps.median;
       }
@@ -1432,7 +1485,7 @@ async function priceSingleItem(catalogId, condition, grade) {
 
   // Active-listing floor is always sourced from eBay (when configured).
   if (hasEbay) {
-    const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name);
+    const activeResult = await fetchActiveLow(keywords, gradeFilter, catalogRow.name, catalogRow);
     activeLow = activeResult.activeLow;
   }
 

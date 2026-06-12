@@ -16,21 +16,25 @@ const CATEGORY_LABELS = {
   sports_card: 'Sports', tcg: 'TCG', comic: 'Comics', sealed: 'Sealed',
 };
 
-const GRADING_COMPANIES = ['PSA', 'BGS', 'CGC', 'SGC', 'CSG', 'HGA'];
+const GRADING_COMPANIES = ['PSA', 'BGS', 'SGC', 'CGC', 'CBCS', 'PGX', 'CSG', 'HGA'];
 
 const pillCls = active =>
   `text-[11px] px-2.5 py-1 rounded-full border transition ${active
     ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
     : 'border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'}`;
 
-// Grade ladders per company — BGS/CGC use half grades, PSA/SGC mostly whole.
-// Companies without a specific ladder get the generic half-step scale.
-const GENERIC_GRADES = ['1', '1.5', '2', '2.5', '3', '3.5', '4', '4.5', '5', '5.5', '6', '6.5', '7', '7.5', '8', '8.5', '9', '9.5', '10'];
+// Grade ladders per company, highest grade first.  CGC/CBCS share the comic
+// decimal scale; PGX has its own.  Companies without a specific ladder get
+// the generic half-step scale.
+const GENERIC_GRADES = ['10', '9.5', '9', '8.5', '8', '7.5', '7', '6.5', '6', '5.5', '5', '4.5', '4', '3.5', '3', '2.5', '2', '1.5', '1'];
+const CGC_SCALE = ['10', '9.9', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.8', '1.5', '1.0', '0.5'];
 const GRADE_OPTIONS = {
-  PSA: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-  BGS: [...GENERIC_GRADES, '10 Black Label'],
-  SGC: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '9.5', '10'],
-  CGC: ['0.5', ...GENERIC_GRADES],
+  PSA:  ['10', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
+  BGS:  ['10 Black Label', ...GENERIC_GRADES],
+  SGC:  ['10', '9.5', '9', '8', '7', '6', '5', '4', '3', '2', '1'],
+  CGC:  CGC_SCALE,
+  CBCS: CGC_SCALE,
+  PGX:  ['10', '9.8', '9.6', '9.4', '9.2', '9.0', '8.5', '8.0', '7.5', '7.0', '6.5', '6.0', '5.5', '5.0', '4.5', '4.0', '3.5', '3.0', '2.5', '2.0', '1.5', '1.0'],
 };
 const gradesFor = company => GRADE_OPTIONS[company] ?? GENERIC_GRADES;
 

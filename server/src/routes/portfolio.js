@@ -408,13 +408,25 @@ router.get('/:id/market', async (req, res) => {
         volume_90d: volume,
         is_user_grade: label === userSeries,
       };
-    });
+    })
+      // Never show a grade without real price data — no $0 / empty rows
+      .filter(g => g.current > 0);
 
     // ── Sold listings + sold median for the user's exact grade ───────────
     // getItemComps is the same helper the pricer uses for the sold median —
     // the Recent Sales list and the Market Value always come from the exact
     // same filtered set.
     const comps = await getItemComps(item.catalog_id, item);
+
+    // Human caption for the fallback case, in the company's own grade format:
+    // "No CGC 8.5 sales found — showing CGC 8.0 and CGC 9.0 for reference"
+    let compsNote = null;
+    if (comps.halfGrade && !comps.filtered && item.grading_company) {
+      const refs = comps.referenceGrades.length
+        ? comps.referenceGrades.map(r => `${item.grading_company} ${r}`).join(' and ')
+        : `nearby ${item.grading_company} grades`;
+      compsNote = `No ${item.grading_company} ${item.grade} sales found — showing ${refs} for reference`;
+    }
 
     res.json({
       user_tier:        userSeries,
@@ -424,6 +436,7 @@ router.get('/:id/market', async (req, res) => {
       sales:            comps.sales,
       sales_filtered:   comps.filtered,
       sales_median:     comps.median,
+      comps_note:       compsNote,
       sales_by_grade:   salesByGrade,
     });
   } catch (err) {
