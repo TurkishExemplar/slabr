@@ -1210,15 +1210,32 @@ async function getItemComps(catalogId, item) {
     }
   }
 
-  sales = sales.slice(0, 30).map(s => ({ ...s, price: parseFloat(s.price) }));
-  const prices = sales.map(s => s.price).filter(p => p > 0).sort((a, b) => a - b);
+  sales = sales.map(s => ({ ...s, price: parseFloat(s.price) }));
+
+  // Recency-weighted valuation.  A median over a year+ of sales badly lags a
+  // fast-appreciating card (a $6K card that traded at $2K through last year
+  // shouldn't read $2K), so value from the last ~90 days.  Only when that
+  // window is too thin — a rarely-traded card — fall back to the trailing few
+  // sales: that's the "unless the sales are very low" case.  Either way the
+  // returned `sales` IS the valuation set, so Recent Sales and the sold
+  // median always show the exact same listings.
+  const RECENT_DAYS = 90, MIN_RECENT = 3, FALLBACK_N = 5;
+  const cutoff = new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const recent = sales.filter(s => s.date >= cutoff);
+  const usedRecentWindow = recent.length >= MIN_RECENT;
+  const valuation = (usedRecentWindow ? recent : sales.slice(0, FALLBACK_N)).slice(0, 30);
+
+  const prices = valuation.map(s => s.price).filter(p => p > 0).sort((a, b) => a - b);
   const median = prices.length ? prices[Math.floor(prices.length / 2)] : null;
 
   // exact=true when the sales are genuinely the item's own grade — only then
   // may the median drive the sold-median price (a mixed 8/9 reference set is
   // display-only context, never a valuation).
   const exact = !halfGrade || filtered;
-  return { bucket, halfGrade, sales, filtered, exact, median, count: prices.length, referenceGrades };
+  return {
+    bucket, halfGrade, sales: valuation, filtered, exact, median,
+    count: prices.length, referenceGrades, recentWindow: usedRecentWindow,
+  };
 }
 
 async function fetchPriceCharting(item) {
